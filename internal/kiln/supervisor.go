@@ -156,8 +156,9 @@ func (s *Supervisor) emit(r *Run, e Event) {
 	}
 }
 
-// Cancel stops a run. With a live supervisor it asks it to stop; if the supervisor is gone
-// (record is stale) it stops the container directly so nothing keeps costing money.
+// Cancel stops a run. With a live supervisor it asks it to stop. If the supervisor is gone
+// (record is stale) it stops the task directly so nothing keeps costing money; if the task
+// already ended on its own (e.g. the in-task deadline fired), it records that outcome instead.
 func Cancel(ctx context.Context, s Store, b Backend, r *Run, now time.Time) (direct bool, err error) {
 	if r.State.Terminal() {
 		return false, &Error{Code: "already_finished", Message: "run " + r.ID + " already " + string(r.State)}
@@ -165,15 +166,18 @@ func Cancel(ctx context.Context, s Store, b Backend, r *Run, now time.Time) (dir
 	if now.Sub(r.UpdatedAt) < StaleAfter {
 		return false, s.RequestCancel(r.ID)
 	}
+	state, reason := Cancelled, "cancelled (supervisor was not running)"
 	if r.Handle != "" {
-		if err := b.Stop(ctx, r.Handle); err != nil {
+		if st, err := b.Status(ctx, r.Handle); err == nil && st.State.Terminal() {
+			state, reason = st.State, st.Reason+" (recorded after supervisor exit)"
+		} else if err := b.Stop(ctx, r.Handle); err != nil {
 			return true, err
 		}
-		_ = b.Remove(ctx, r.Handle) // best effort: Stop already ended the spend
+		_ = b.Remove(ctx, r.Handle) // best effort: the spend has already ended
 	}
 	// ponytail: a run that crashed mid-Start has no handle; its container (kiln-<id>) needs a manual rm.
-	r.State, r.Reason, r.EndedAt = Cancelled, "cancelled (supervisor was not running)", &now
-	r.Events = append(r.Events, Event{At: now, State: Cancelled, Message: r.Reason})
+	r.State, r.Reason, r.EndedAt = state, reason, &now
+	r.Events = append(r.Events, Event{At: now, State: state, Message: reason})
 	return true, s.Save(r)
 }
 

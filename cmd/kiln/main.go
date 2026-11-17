@@ -31,9 +31,13 @@ commands:
   logs <run> [-f]           run logs
   cancel <run>              stop a run
   diff <a> <b>              what changed between two runs
+  version                   print the kiln version
 
 every command accepts --json for machine-readable output.
 `
+
+// version is set at release build time: -ldflags "-X main.version=v1.0.0".
+var version = "dev"
 
 type app struct {
 	out   io.Writer
@@ -59,6 +63,10 @@ func (a *app) main(args []string) int {
 	}
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(a.out, usage)
+		return 0
+	}
+	if cmd == "version" || cmd == "--version" {
+		a.emit(map[string]string{"version": version}, func() { fmt.Fprintln(a.out, "kiln", version) })
 		return 0
 	}
 	h, ok := handlers[cmd]
@@ -241,9 +249,9 @@ func (a *app) cmdCancel(args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	a.emit(map[string]any{"id": r.ID, "cancelled": direct, "cancel_requested": !direct}, func() {
+	a.emit(map[string]any{"id": r.ID, "state": r.State, "cancel_requested": !direct}, func() {
 		if direct {
-			fmt.Fprintf(a.out, "%s cancelled (supervisor was gone; container stopped)\n", r.ID)
+			fmt.Fprintf(a.out, "%s %s: %s\n", r.ID, r.State, r.Reason)
 		} else {
 			fmt.Fprintf(a.out, "%s cancel requested; its supervisor stops it within a few seconds\n", r.ID)
 		}

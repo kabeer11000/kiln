@@ -233,3 +233,18 @@ func TestCancelStaleRunStopsContainerDirectly(t *testing.T) {
 		t.Fatal("cancelling a finished run should fail")
 	}
 }
+
+func TestCancelStaleRunRecordsOutcomeIfTaskAlreadyEnded(t *testing.T) {
+	// Supervisor died, then the in-task deadline stopped the task. Record what really happened.
+	now := time.Now()
+	f := &fake{clock: &now, exitAfter: time.Nanosecond, exitState: TimedOut}
+	s := Store{Dir: t.TempDir()}
+	r := NewRun(Config{Name: "t", Image: "x", Budget: roomy}, now)
+	r.State, r.Handle = Running, "c1"
+	_ = s.Save(r)
+	now = now.Add(time.Minute)
+	direct, err := Cancel(context.Background(), s, f, r, now)
+	if err != nil || !direct || r.State != TimedOut || f.stops != 0 || f.removes != 1 {
+		t.Fatalf("direct=%v err=%v state=%s stops=%d removes=%d", direct, err, r.State, f.stops, f.removes)
+	}
+}
