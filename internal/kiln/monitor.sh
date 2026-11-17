@@ -80,7 +80,32 @@ final() { outbox; snap final; upload; exit "$1"; }
 trap 'final 143' TERM INT
 
 APK=""
-if [ -n "${KILN_UPLOAD_URL:-}" ]; then apk add --no-cache -q curl >/dev/null 2>&1 & APK=$!; fi
+if [ -n "${KILN_REPO_URL:-}" ]; then
+  # Repo: clone the exact commit into /kiln/src (the agent's default workdir) before it starts.
+  # The token goes in an HTTP header only: never in a URL, a remote, or .git/config.
+  T0=$(date +%s)
+  apk add --no-cache -q git curl >/dev/null 2>&1
+  g() {
+    if [ -n "${KILN_REPO_TOKEN:-}" ]; then
+      git -c http.extraHeader="Authorization: Basic $(printf 'x-access-token:%s' "$KILN_REPO_TOKEN" | base64 | tr -d '\n')" "$@"
+    else git "$@"; fi
+  }
+  mkdir -p "$D/src" && cd "$D/src" && git init -q &&
+  { g fetch -q --depth 1 "$KILN_REPO_URL" "$KILN_REPO_SHA" 2>/tmp/git.err ||
+    g fetch -q "$KILN_REPO_URL" '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' 2>/tmp/git.err; } &&
+  git checkout -q "$KILN_REPO_SHA" 2>/tmp/git.err
+  if [ $? -eq 0 ]; then
+    chmod -R a+rwX "$D/src"
+    echo "{\"kiln\":\"repo\",\"t\":$(date +%s),\"sha\":\"$KILN_REPO_SHA\",\"kb\":$(du -sk "$D/src" | cut -f1),\"secs\":$(( $(date +%s) - T0 ))}"
+    cd /
+  else
+    E=$(head -c 300 /tmp/git.err | tr '\n\t"\\' '    ')
+    echo "{\"kiln\":\"repo_failed\",\"t\":$(date +%s),\"line\":\"$E\"}"
+    exit 1
+  fi
+elif [ -n "${KILN_UPLOAD_URL:-}" ]; then
+  apk add --no-cache -q curl >/dev/null 2>&1 & APK=$!
+fi
 # Inputs: unpack into /kiln/inputs before the agent starts. The agent waits for /kiln/.ready
 # (ECS health check + dependsOn HEALTHY). A failed download fails the run: exit 1, never 0.
 if [ -n "${KILN_INPUTS_URL:-}" ]; then

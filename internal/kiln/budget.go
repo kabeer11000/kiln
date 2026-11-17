@@ -34,3 +34,9 @@ func (b Budget) Remaining(elapsed time.Duration, pricePerHour float64) time.Dura
 func (b Budget) MaxSpend(pricePerHour float64) float64 {
 	return min(b.MaxUSD, pricePerHour*b.MaxHours)
 }
+
+// CapDuration is how long a run can go before its first cap: the hour cap, or the time the
+// dollar cap is reached at this price.
+func (b Budget) CapDuration(pricePerHour float64) time.Duration {
+	return b.Remaining(0, pricePerHour)
+}

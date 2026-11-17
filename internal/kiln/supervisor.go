@@ -41,6 +41,9 @@ func (s *Supervisor) Run(ctx context.Context, r *Run) error {
 	if err := s.Store.Save(r); err != nil {
 		return err
 	}
+	if s.Store.CancelRequested(r.ID) { // cancelled while queued (e.g. right after `run -d`)
+		return s.finish(r, Cancelled, "cancel requested before start")
+	}
 	h, err := s.Backend.Start(ctx, r)
 	if err != nil {
 		return s.finish(r, Failed, "start failed: "+err.Error())
@@ -54,15 +57,19 @@ func (s *Supervisor) Run(ctx context.Context, r *Run) error {
 	defer s.live.stop()
 
 	b := r.Config.Budget
+	reserve := StopReserveOf(s.Backend)
 	warned, statusErrs := false, 0
 	for {
 		s.live.drain(s, r)
+		if s.Store.CancelRequested(r.ID) { // also catches a cancel that arrived during Start
+			return s.finish(r, Cancelled, "cancel requested")
+		}
 		if err := s.Store.Save(r); err != nil {
 			// Can't record progress, so we can't enforce safely: stop spending.
 			return errors.Join(err, s.Backend.Stop(context.Background(), r.Handle))
 		}
 		// Wake at the next tick, or exactly when a cap is reached, whichever is sooner.
-		s.Sleep(ctx, min(s.Tick, b.Remaining(s.Now().Sub(started), r.PricePerHour)))
+		s.Sleep(ctx, min(s.Tick, b.Remaining(s.Now().Sub(started)+reserve, r.PricePerHour)))
 		if ctx.Err() != nil {
 			return s.finish(r, Cancelled, "interrupted")
 		}
@@ -71,18 +78,24 @@ func (s *Supervisor) Run(ctx context.Context, r *Run) error {
 		}
 
 		// Caps are checked before the backend call, so a slow backend never adds overshoot.
+		// Decisions count the shutdown time too (reserve): it is billed, so stopping that much
+		// early keeps the final total within the cap.
 		elapsed := s.Now().Sub(started)
-		spent, stop, warn := b.Check(elapsed, r.PricePerHour)
-		r.SpentUSD = spent
+		_, stop, warn := b.Check(elapsed+reserve, r.PricePerHour)
+		r.SpentUSD = elapsed.Hours() * r.PricePerHour
+		early := ""
+		if reserve > 0 {
+			early = fmt.Sprintf("; stopping %s early because shutdown is billed too", reserve)
+		}
 		switch stop {
 		case BudgetExceeded:
-			return s.finish(r, stop, fmt.Sprintf("spent %s of %s cap", usd(spent), usd(b.MaxUSD)))
+			return s.finish(r, stop, fmt.Sprintf("reached the %s cap (spent %s so far%s)", usd(b.MaxUSD), usd(r.SpentUSD), early))
 		case TimedOut:
-			return s.finish(r, stop, fmt.Sprintf("ran %s, cap is %gh", elapsed.Round(time.Second), b.MaxHours))
+			return s.finish(r, stop, fmt.Sprintf("reached the %gh cap (ran %s%s)", b.MaxHours, elapsed.Round(time.Second), early))
 		}
 
 		// The call may not outlive the cap: a slow backend is cut off, and the next loop enforces it.
-		sctx, cancel := context.WithTimeout(ctx, min(statusTimeout, b.Remaining(elapsed, r.PricePerHour)))
+		sctx, cancel := context.WithTimeout(ctx, min(statusTimeout, b.Remaining(elapsed+reserve, r.PricePerHour)))
 		st, err := s.Backend.Status(sctx, r.Handle)
 		cancel()
 		if err != nil {
@@ -101,7 +114,7 @@ func (s *Supervisor) Run(ctx context.Context, r *Run) error {
 		if warn && !warned {
 			warned = true
 			s.event(r, fmt.Sprintf("warning: past %.0f%% of a cap (spent %s of %s, ran %s of %gh)",
-				b.WarnAt*100, usd(spent), usd(b.MaxUSD), elapsed.Round(time.Second), b.MaxHours))
+				b.WarnAt*100, usd(r.SpentUSD), usd(b.MaxUSD), elapsed.Round(time.Second), b.MaxHours))
 		}
 	}
 }
@@ -127,7 +140,13 @@ func (s *Supervisor) finish(r *Run, st State, reason string) error {
 	}
 	now := s.Now()
 	r.EndedAt, r.Reason = &now, reason
-	r.SpentUSD = r.Duration(now).Hours() * r.PricePerHour // true final spend, including stop time
+	r.SpentUSD = r.Duration(now).Hours() * r.PricePerHour // final spend including stop time, as kiln saw it
+	if r.Handle != "" {
+		// Better: the provider's own billed period, which isn't inflated by slow API calls here.
+		if st, err := s.Backend.Status(ctx, r.Handle); err == nil && !st.BilledFrom.IsZero() && st.BilledTo.After(st.BilledFrom) {
+			r.SpentUSD = st.BilledTo.Sub(st.BilledFrom).Hours() * r.PricePerHour
+		}
+	}
 	if r.Handle != "" {
 		// Not fatal: the outcome still gets recorded.
 		if err := s.saveLogs(ctx, r); err != nil {
@@ -158,17 +177,19 @@ func (s *Supervisor) saveLogs(ctx context.Context, r *Run) error {
 // through drain, on the supervisor's goroutine, so the record is never written concurrently.
 type liveMonitor struct {
 	events chan string
-	// lines counts each record line processed live. The final replay emits events only for
-	// lines not in here: the live stream can miss records (CloudWatch's forward token is
-	// time-based, so a late-indexed record is skipped) and must not cause duplicates either.
-	lines  map[string]int
+	lines  map[string]int // record lines processed, so a reconnect doesn't reprocess them
+	// sent counts each event already added to the record. The final replay of the full stream
+	// adds only events not in here. Comparing events, not lines, matters: the live stream can
+	// skip a record (CloudWatch's forward token is time-based, so a late-indexed record is
+	// missed), and then it notices e.g. a process exit one reading later than the replay does.
+	sent   map[string]int
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 func (s *Supervisor) watch(ctx context.Context, r *Run) *liveMonitor {
 	ctx, cancel := context.WithCancel(ctx)
-	l := &liveMonitor{events: make(chan string, 256), lines: map[string]int{}, cancel: cancel, done: make(chan struct{})}
+	l := &liveMonitor{events: make(chan string, 256), lines: map[string]int{}, sent: map[string]int{}, cancel: cancel, done: make(chan struct{})}
 	o, ok := s.Backend.(Observer)
 	if !ok {
 		close(l.done)
@@ -208,6 +229,7 @@ func (l *liveMonitor) drain(s *Supervisor, r *Run) {
 	for {
 		select {
 		case e := <-l.events:
+			l.sent[e]++
 			s.event(r, e)
 		default:
 			return
@@ -236,21 +258,13 @@ func (s *Supervisor) saveMonitor(ctx context.Context, r *Run) error {
 	if err := os.WriteFile(s.Store.MonitorPath(r.ID), buf.Bytes(), 0o644); err != nil {
 		return err
 	}
-	w, liveSeen := &Watcher{}, s.live.lines // safe to read: the live goroutine has exited
-	sc := bufio.NewScanner(&buf)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
-	for sc.Scan() {
-		line := sc.Text()
-		_, evs := w.Feed(line) // always fed, so state (CPU, exits) matches the live view
-		if liveSeen[line] > 0 {
-			liveSeen[line]--
-			continue
+	return WatchMonitor(&buf, &Watcher{}, func(e string) {
+		if s.live.sent[e] > 0 {
+			s.live.sent[e]--
+			return
 		}
-		for _, e := range evs {
-			s.event(r, e)
-		}
-	}
-	return sc.Err()
+		s.event(r, e)
+	}, nil)
 }
 
 // heartbeat touches the run's .alive file every few seconds until the returned stop is called.
@@ -297,17 +311,25 @@ func Cancel(ctx context.Context, s Store, b Backend, r *Run, now time.Time) (dir
 		return false, s.RequestCancel(r.ID)
 	}
 	state, reason := Cancelled, "cancelled (supervisor was not running)"
+	var billed Status
 	if r.Handle != "" {
 		if st, err := b.Status(ctx, r.Handle); err == nil && st.State.Terminal() {
-			state, reason = st.State, st.Reason+" (recorded after supervisor exit)"
+			state, reason, billed = st.State, st.Reason+" (recorded after supervisor exit)", st
 		} else if err := b.Stop(ctx, r.Handle); err != nil {
 			return true, err
+		} else if st, err := b.Status(ctx, r.Handle); err == nil {
+			billed = st
 		}
 		_ = b.Remove(ctx, r.Handle) // best effort: the spend has already ended
 	}
 	// ponytail: a run that crashed mid-Start has no handle; its container (kiln-<id>) needs a manual rm.
 	r.State, r.Reason, r.EndedAt = state, reason, &now
-	r.SpentUSD = r.Duration(now).Hours() * r.PricePerHour // billed until now: the latest it can have stopped
+	r.SpentUSD = r.Duration(now).Hours() * r.PricePerHour // without provider times: the latest it can have stopped
+	if !billed.BilledFrom.IsZero() && billed.BilledTo.After(billed.BilledFrom) {
+		r.SpentUSD = billed.BilledTo.Sub(billed.BilledFrom).Hours() * r.PricePerHour
+		end := billed.BilledTo
+		r.EndedAt = &end
+	}
 	r.Events = append(r.Events, Event{At: now, State: state, Message: reason})
 	return true, s.Save(r)
 }

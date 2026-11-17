@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/kabeer11000/kiln/main/internal/kiln/kiln.schema.json",
+  "title": "kiln.yaml",
+  "description": "One kiln run: what to run, where, and its hard caps. Unknown fields are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "image"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "description": "Run name prefix. Each run gets <name>/<adjective>-<noun> and an id like r_abc123."
+    },
+    "backend": {
+      "enum": [
+        "aws",
+        "docker",
+        "podman"
+      ],
+      "default": "aws",
+      "description": "Where it runs. aws: ECS Fargate (needs deploy/aws; nothing runs or builds on your machine). docker/podman: this machine."
+    },
+    "image": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Container image. Pin with @sha256:... for exact reproducibility; kiln records the digest either way."
+    },
+    "command": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Overrides the image's command, e.g. [\"sh\", \"-c\", \"npm test\"]."
+    },
+    "env": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Plain environment variables. Stored in the run record: never put secrets here."
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "description": "Secret names only. docker: read from your environment. aws: from SSM /kiln/<stack>/secrets/<NAME>. Values are never stored."
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Files/folders (relative to kiln.yaml) copied to /kiln/inputs before the agent starts. \".\" sends the whole folder (contents at the top, .git and .kiln skipped) and must be the only entry. Up to 512 MB packed."
+    },
+    "exclude": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Glob patterns left out of inputs, matched against names and paths, e.g. [node_modules, \"*.log\", dist]."
+    },
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ],
+      "description": "A git repository checked out at /kiln/src before the command starts, so a stock image (node, python, golang...) can run your project with nothing built locally. The ref is pinned to the exact commit when the run starts; kiln rerun reuses that commit. On aws it is cloned inside the task (big repos never pass through your machine).",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "https://... or git@... URL."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Branch, tag or full commit SHA. Default: the repo's default branch."
+        },
+        "token": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "For private https repos: the NAME of a secret holding a token (aws: SSM /kiln/<stack>/secrets/<NAME>; docker: your environment). Sent as an HTTP header, never stored in the checkout. The agent can read it: use a read-only token."
+        }
+      }
+    },
+    "workdir": {
+      "type": "string",
+      "pattern": "^/",
+      "description": "Folder the command runs in. Default /kiln/src when repo is set, else the image's own."
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Hard caps. The run is stopped at whichever is reached first. 0 means the default; caps cannot be turned off.",
+      "properties": {
+        "max_usd": {
+          "type": "number",
+          "minimum": 0,
+          "default": 5,
+          "description": "Dollar cap for compute."
+        },
+        "max_hours": {
+          "type": "number",
+          "minimum": 0,
+          "default": 1,
+          "description": "Wall-clock cap in hours."
+        },
+        "warn_at": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8,
+          "description": "Fraction of either cap at which a warning event is recorded."
+        },
+        "price_per_hour": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Override the backend's $/hour (e.g. to test caps on docker, which is otherwise free)."
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "type": "number",
+          "minimum": 0,
+          "default": 1,
+          "description": "vCPUs. aws: rounded up to a valid Fargate size."
+        },
+        "memory_gb": {
+          "type": "number",
+          "minimum": 0,
+          "default": 2,
+          "description": "Memory in GB."
+        },
+        "spot": {
+          "type": "boolean",
+          "default": false,
+          "description": "aws: Fargate Spot, about 70% cheaper, can be interrupted."
+        }
+      }
+    },
+    "aws": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Only with backend: aws.",
+      "properties": {
+        "region": {
+          "type": "string",
+          "default": "us-east-1"
+        },
+        "stack": {
+          "type": "string",
+          "default": "kiln",
+          "description": "Which deploy/aws install to use."
+        }
+      }
+    }
+  }
+}

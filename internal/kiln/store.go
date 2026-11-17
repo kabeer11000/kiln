@@ -103,7 +103,8 @@ func (s Store) Find(ref string) (*Run, error) {
 	}
 	switch len(hits) {
 	case 0:
-		return nil, &Error{Code: "run_not_found", Message: "no run matches " + ref, Fix: "run `kiln list` to see runs"}
+		return nil, &Error{Code: "run_not_found", Message: "no run matches " + ref + " in " + s.Dir,
+			Fix: "run `kiln list` to see runs; runs from another machine or another " + HomeEnv + " are not here"}
 	case 1:
 		return hits[0], nil
 	}

@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFargateSize(t *testing.T) {
@@ -49,15 +50,15 @@ func TestFargatePrice(t *testing.T) {
 
 func TestDeadlineSeconds(t *testing.T) {
 	// Hour cap binds: 0.5h.
-	if got := deadlineSeconds(Budget{MaxUSD: 100, MaxHours: 0.5}, 1); got != 1800+deadlineGrace {
+	if got := deadlineSeconds(Budget{MaxUSD: 100, MaxHours: 0.5}, 1); got != 1800-60+deadlineGrace {
 		t.Errorf("hour cap: %d", got)
 	}
 	// Dollar cap binds: $1 at $10/h = 6 min.
-	if got := deadlineSeconds(Budget{MaxUSD: 1, MaxHours: 10}, 10); got != 360+deadlineGrace {
+	if got := deadlineSeconds(Budget{MaxUSD: 1, MaxHours: 10}, 10); got != 360-60+deadlineGrace {
 		t.Errorf("dollar cap: %d", got)
 	}
 	// Free: only the hour cap applies.
-	if got := deadlineSeconds(Budget{MaxUSD: 1, MaxHours: 1}, 0); got != 3600+deadlineGrace {
+	if got := deadlineSeconds(Budget{MaxUSD: 1, MaxHours: 1}, 0); got != 3600-60+deadlineGrace {
 		t.Errorf("free: %d", got)
 	}
 }
@@ -80,7 +81,7 @@ func TestTaskDefinition(t *testing.T) {
 		`"family":"kiln-kiln-exp"`, `"cpu":"256"`, `"memory":"512"`,
 		`"command":["echo","hi"]`, `{"name":"MODE","value":"fast"}`, `{"name":"KILN_RUN_ID","value":"r_1"}`,
 		`{"name":"TOKEN","valueFrom":"/kiln/kiln/secrets/TOKEN"}`,
-		`"name":"kiln-monitor"`, `{"name":"KILN_DEADLINE","value":"3660"}`, `"essential":true`,
+		`"name":"kiln-monitor"`, `{"name":"KILN_DEADLINE","value":"3555"}`, `"essential":true`,
 		`{"name":"KILN_UPLOAD_URL","value":"https://up"}`, `"pidMode":"task"`, `"volumes":[{"name":"kiln"}]`,
 		`"containerPath":"/kiln"`, `"dependsOn":[{"condition":"HEALTHY","containerName":"kiln-monitor"}]`,
 		`{"name":"KILN_DIR","value":"/kiln"}`,
@@ -134,7 +135,7 @@ func TestAWSConfigDefaults(t *testing.T) {
 	if c.AWS == nil || c.AWS.Region != "us-east-1" || c.AWS.Stack != "kiln" {
 		t.Fatalf("aws defaults: %+v", c.AWS)
 	}
-	if _, err := LoadConfig(writeConfig(t, "name: a\nimage: x\naws: {stack: s}\n")); err == nil {
+	if _, err := LoadConfig(writeConfig(t, "name: a\nimage: x\nbackend: docker\naws: {stack: s}\n")); err == nil {
 		t.Fatal("aws block with docker backend should be rejected")
 	}
 }
@@ -148,5 +149,21 @@ func TestMonitorCommandHasNoCR(t *testing.T) {
 	mon := td["containerDefinitions"].([]any)[1].(map[string]any)
 	if cmd := mon["command"].([]string); strings.ContainsRune(cmd[2], 13) {
 		t.Error("monitor script has carriage returns; sh in the task will fail")
+	}
+}
+
+func TestECSBilledPeriod(t *testing.T) {
+	var tk ecsTask
+	json.Unmarshal([]byte(`{"lastStatus":"STOPPED","createdAt":"2026-11-17T18:58:40.000000+05:00",
+		"pullStartedAt":"2026-11-17T18:58:45.500000+05:00","stoppedAt":"2026-11-17T19:00:51.419000+05:00",
+		"containers":[{"name":"agent","exitCode":0}]}`), &tk)
+	st := tk.status()
+	if got := st.BilledTo.Sub(st.BilledFrom); got != 125919*time.Millisecond {
+		t.Errorf("billed %s, want 2m5.919s (pull start to stop)", got)
+	}
+	var running ecsTask
+	json.Unmarshal([]byte(`{"lastStatus":"RUNNING","createdAt":"2026-11-17T18:58:40+05:00"}`), &running)
+	if st := running.status(); !st.BilledTo.IsZero() || st.BilledFrom.IsZero() {
+		t.Errorf("running task: from %v to %v; no end yet, start falls back to createdAt", st.BilledFrom, st.BilledTo)
 	}
 }

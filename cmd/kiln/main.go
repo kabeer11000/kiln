@@ -31,7 +31,10 @@ commands:
                             start and supervise a run (--plan: show cost, don't start;
                             -d: start in the background and return the run id)
   rerun <run> [-d]          run again with the same image digest and identical inputs
-  wait <run>                block until a run ends; exit code is its outcome
+  wait <run> [--timeout 10m]
+                            block until a run ends; exit code is its outcome
+  schema                    JSON Schema for kiln.yaml (editors, agents)
+  mcp                       MCP server on stdio: every command as a tool for AI agents
   list                      all runs, newest first
   status <run>              one run (id, id prefix, or name)
   logs <run> [-f]           run logs
@@ -66,7 +69,16 @@ func (a *app) context() context.Context {
 
 func main() {
 	args, asJSON := extractJSON(os.Args[1:])
-	a := &app{out: os.Stdout, json: asJSON, store: kiln.Store{Dir: ".kiln/runs"}}
+	a := &app{out: os.Stdout, json: asJSON}
+	st, err := kiln.DefaultStore()
+	if err != nil {
+		os.Exit(a.fail(err, 1))
+	}
+	a.store = st
+	// v1.0/v1.1 kept runs in ./.kiln/runs; bring them into the shared store once.
+	if n, err := st.ImportLegacy(filepath.Join(".kiln", "runs")); err == nil && n > 0 {
+		fmt.Fprintf(os.Stderr, "kiln: imported %d run(s) from .kiln/runs into %s\n", n, st.Dir)
+	}
 	os.Exit(a.main(args))
 }
 
@@ -81,13 +93,16 @@ func (a *app) main(args []string) int {
 		"status": a.cmdStatus, "logs": a.cmdLogs, "cancel": a.cmdCancel, "diff": a.cmdDiff,
 		"top": a.cmdTop, "send": a.cmdSend, "artifacts": a.cmdArtifacts, "serve": a.cmdServe,
 		"rerun": a.cmdRerun, "wait": a.cmdWait, "_supervise": a.cmdSupervise,
+		"schema": a.cmdSchema, "mcp": a.cmdMCP,
 	}
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(a.out, usage)
 		return 0
 	}
 	if cmd == "version" || cmd == "--version" {
-		a.emit(map[string]string{"version": version}, func() { fmt.Fprintln(a.out, "kiln", version) })
+		a.emit(map[string]string{"version": version, "runs_dir": a.store.Dir}, func() {
+			fmt.Fprintf(a.out, "kiln %s (runs in %s)\n", version, a.store.Dir)
+		})
 		return 0
 	}
 	h, ok := handlers[cmd]
@@ -106,13 +121,24 @@ func (a *app) main(args []string) int {
 }
 
 func (a *app) cmdInit(args []string) (int, error) {
-	if _, err := a.parse("init", args, 0); err != nil {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	backend := fs.String("backend", "aws", "aws | docker | podman")
+	if _, err := a.parseFS(fs, args, 0); err != nil {
 		return 2, err
 	}
 	if _, err := os.Stat(kiln.DefaultFile); err == nil {
 		return 1, &kiln.Error{Code: "config_exists", Message: kiln.DefaultFile + " already exists", Fix: "edit it, or delete it and run `kiln init` again"}
 	}
-	if err := os.WriteFile(kiln.DefaultFile, []byte(starterConfig), 0o644); err != nil {
+	extra := ""
+	switch *backend {
+	case "aws":
+		extra = starterAWS
+	case "docker", "podman":
+	default:
+		return 2, &kiln.Error{Code: "usage", Message: "init: unknown backend " + *backend, Fix: "use --backend aws, docker or podman"}
+	}
+	cwd, _ := os.Getwd()
+	if err := os.WriteFile(kiln.DefaultFile, []byte(fmt.Sprintf(starterConfig, runName(filepath.Base(cwd)), *backend, extra)), 0o644); err != nil {
 		return 1, err
 	}
 	a.emit(map[string]string{"created": kiln.DefaultFile}, func() {
@@ -159,20 +185,41 @@ func (a *app) cmdRun(args []string) (int, error) {
 	r := kiln.NewRun(c, time.Now())
 	r.PricePerHour = kiln.PriceFor(c, b)
 	r.GitSHA, r.GitDirty = gitInfo()
+	r.Dir, _ = os.Getwd()
+	if r.Repo, err = kiln.ResolveRepo(a.context(), c.Repo); err != nil {
+		return 1, err
+	}
 
+	// Starting and stopping alone take about twice the stop reserve; a cap below that can't be met.
+	var warnings []string
+	if reserve := kiln.StopReserveOf(b); reserve > 0 && c.Budget.CapDuration(r.PricePerHour) < 2*reserve {
+		warnings = append(warnings, fmt.Sprintf("the caps allow %s of running, but starting and stopping a task alone take about %s; the run will stop right away and may cost more than max_usd",
+			c.Budget.CapDuration(r.PricePerHour).Round(time.Second), 2*reserve))
+	}
 	if *plan {
 		p := map[string]any{
 			"name": c.Name, "backend": c.Backend, "image": c.Image, "price_per_hour": r.PricePerHour,
 			"max_usd": c.Budget.MaxUSD, "max_hours": c.Budget.MaxHours, "max_spend_usd": c.Budget.MaxSpend(r.PricePerHour),
+			"repo": r.Repo, "warnings": orEmpty(warnings),
 		}
 		a.emit(p, func() {
 			fmt.Fprintf(a.out, "plan: %s on %s (%s)\n  price:     $%.4f/h\n  caps:      $%g or %gh, whichever first\n  max spend: $%.4f\n",
 				c.Name, c.Backend, c.Image, r.PricePerHour, c.Budget.MaxUSD, c.Budget.MaxHours, c.Budget.MaxSpend(r.PricePerHour))
+			if r.Repo != nil {
+				fmt.Fprintf(a.out, "  repo:      %s @ %s (%s), checked out at %s\n", r.Repo.URL, r.Repo.SHA[:12], r.Repo.Ref, c.Workdir)
+			}
+			fmt.Fprintln(a.out, "  caps include shutdown time, which is billed: kiln stops early enough to stay within them")
+			for _, w := range warnings {
+				fmt.Fprintln(a.out, "  warning:  ", w)
+			}
 		})
 		return 0, nil
 	}
+	for _, w := range warnings {
+		r.Events = append(r.Events, kiln.Event{At: time.Now(), Message: "warning: " + w})
+	}
 	if len(c.Inputs) > 0 {
-		r.Inputs, err = kiln.PackInputs(filepath.Dir(*file), c.Inputs, a.store.InputsPath(r.ID))
+		r.Inputs, err = kiln.PackInputs(filepath.Dir(*file), c.Inputs, c.Exclude, a.store.InputsPath(r.ID))
 		if err != nil {
 			return 1, err
 		}
@@ -253,18 +300,34 @@ func (a *app) cmdRerun(args []string) (int, error) {
 	}
 	r := kiln.NewRun(c, time.Now())
 	r.PricePerHour = kiln.PriceFor(c, b)
-	r.GitSHA, r.GitDirty, r.Inputs, r.RerunOf = old.GitSHA, old.GitDirty, old.Inputs, old.ID
+	r.GitSHA, r.GitDirty, r.Inputs, r.RerunOf, r.Dir, r.Repo = old.GitSHA, old.GitDirty, old.Inputs, old.ID, old.Dir, old.Repo
+	if r.Inputs != nil {
+		in := *r.Inputs // the archive lives with the old run in the store
+		in.Local = a.store.InputsPath(old.ID)
+		r.Inputs = &in
+	}
 	return a.start(r, b, *detach)
 }
 
 // cmdWait blocks until a run ends and exits with its state's exit code.
 func (a *app) cmdWait(args []string) (int, error) {
-	r, err := a.findArg("wait", args)
+	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", 0, "give up after this long (e.g. 10m); 0 = until the run ends")
+	pos, err := a.parseFS(fs, args, 1)
+	if err != nil {
+		return 2, err
+	}
+	r, err := a.store.Find(pos[0])
 	if err != nil {
 		return 1, err
 	}
 	ctx, stop := signal.NotifyContext(a.context(), os.Interrupt)
 	defer stop()
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
 	for !r.State.Terminal() {
 		if a.store.Stale(r, time.Now()) {
 			return 1, &kiln.Error{Code: "supervisor_gone", Message: "no kiln process is supervising " + r.ID,
@@ -272,6 +335,10 @@ func (a *app) cmdWait(args []string) (int, error) {
 		}
 		select {
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return 1, &kiln.Error{Code: "still_running", Message: fmt.Sprintf("%s is still %s after %s", r.ID, r.State, *timeout),
+					Fix: "wait again, check progress with `kiln top " + r.ID + "`, or `kiln cancel " + r.ID + "`"}
+			}
 			return 1, &kiln.Error{Code: "interrupted", Message: "stopped waiting; the run continues"}
 		case <-time.After(2 * time.Second):
 		}
@@ -286,12 +353,24 @@ func (a *app) cmdWait(args []string) (int, error) {
 }
 
 func (a *app) cmdList(args []string) (int, error) {
-	if _, err := a.parse("list", args, 0); err != nil {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	here := fs.Bool("here", false, "only runs started from this folder")
+	if _, err := a.parseFS(fs, args, 0); err != nil {
 		return 2, err
 	}
-	runs, err := a.store.List()
+	all, err := a.store.List()
 	if err != nil {
 		return 1, err
+	}
+	runs := all
+	if *here {
+		cwd, _ := os.Getwd()
+		runs = nil
+		for _, r := range all {
+			if r.Dir == cwd {
+				runs = append(runs, r)
+			}
+		}
 	}
 	a.emit(orEmpty(runs), func() {
 		tw := tabwriter.NewWriter(a.out, 0, 0, 2, ' ', 0)
@@ -311,10 +390,21 @@ func (a *app) cmdStatus(args []string) (int, error) {
 		return 1, err
 	}
 	stale := a.store.Stale(r, time.Now())
-	a.emit(map[string]any{"run": r, "stale": stale}, func() {
+	cancelling := !r.State.Terminal() && a.store.CancelRequested(r.ID)
+	a.emit(map[string]any{"run": r, "stale": stale, "cancel_requested": cancelling}, func() {
+		state := string(r.State)
+		if cancelling {
+			state += " (cancel requested; stopping)"
+		}
 		fmt.Fprintf(a.out, "%s  %s\n  state:   %s\n  spent:   $%.4f of $%g (at $%.4f/h)\n  ran:     %s of %gh\n",
-			r.ID, r.Name, r.State, r.SpentUSD, r.Config.Budget.MaxUSD, r.PricePerHour,
+			r.ID, r.Name, state, r.SpentUSD, r.Config.Budget.MaxUSD, r.PricePerHour,
 			r.Duration(time.Now()).Round(time.Second), r.Config.Budget.MaxHours)
+		if r.Dir != "" {
+			fmt.Fprintf(a.out, "  from:    %s\n", r.Dir)
+		}
+		if r.Repo != nil {
+			fmt.Fprintf(a.out, "  repo:    %s @ %s (%s)\n", r.Repo.URL, r.Repo.SHA[:min(12, len(r.Repo.SHA))], r.Repo.Ref)
+		}
 		if r.Reason != "" {
 			fmt.Fprintf(a.out, "  reason:  %s\n", r.Reason)
 		}
@@ -640,23 +730,58 @@ func gitInfo() (sha string, dirty bool) {
 	return strings.TrimSpace(string(out)), len(strings.TrimSpace(string(st))) > 0
 }
 
-const starterConfig = `# kiln run config. Reference: SPEC.md
-name: my-experiment
-backend: docker            # docker | podman | aws
-image: alpine:3.20
-command: ["sh", "-c", "echo hello from kiln; sleep 5"]
+// starterConfig is what `kiln init` writes. %[1]s name, %[2]s backend, %[3]s backend-specific lines.
+const starterConfig = `# yaml-language-server: $schema=https://raw.githubusercontent.com/kabeer11000/kiln/main/internal/kiln/kiln.schema.json
+# kiln run config. Every field: ` + "`kiln schema`" + `. Check it: ` + "`kiln validate`" + `, cost: ` + "`kiln run --plan`" + `.
+name: %[1]s
+backend: %[2]s              # aws | docker | podman
+image: public.ecr.aws/docker/library/alpine:3.20
+command: ["sh", "-c", "echo hello from kiln; ls /kiln/inputs; echo done > /kiln/artifacts/result.txt"]
+
+# Files in: copied to /kiln/inputs before the command starts ("." = this whole folder).
+inputs: ["."]
+exclude: [node_modules, "*.log"]
+# Files out: anything written to /kiln/artifacts. Get it with ` + "`kiln artifacts <run>`" + `.
 
 budget:
-  max_usd: 5               # hard cap: the run is killed when reached
+  max_usd: 1               # hard cap: the run is stopped when reached
   max_hours: 1             # hard wall-clock cap
-  warn_at: 0.8             # warn at 80% of either cap
-  # price_per_hour: 0.05   # override the backend price (useful to test caps locally)
+  warn_at: 0.8             # warn at 80%% of either cap
+  # price_per_hour: 0.05   # override the price (e.g. to try the cap on docker, which is free)
 
 resources:
   cpu: 1
   memory_gb: 2
-
+%[3]s
 # env:
 #   MODE: fast
-# secrets: [LLM_API_KEY]   # docker: read from your env; aws: from SSM. Never stored
+# secrets: [LLM_API_KEY]   # docker: from your environment; aws: from SSM. Never stored
 `
+
+const starterAWS = `  spot: true               # ~70% cheaper; may be interrupted
+
+aws:
+  region: us-east-1
+  stack: kiln
+`
+
+// runName turns a folder name into a valid run name: lowercase letters, digits, dashes.
+func runName(folder string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(folder) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case b.Len() > 0 && !strings.HasSuffix(b.String(), "-"):
+			b.WriteByte('-')
+		}
+	}
+	name := strings.Trim(b.String(), "-")
+	if len(name) > 63 {
+		name = strings.Trim(name[:63], "-")
+	}
+	if name == "" {
+		return "my-run"
+	}
+	return name
+}

@@ -45,6 +45,9 @@ type MonitorRecord struct {
 	Lines    int    `json:"lines,omitempty"`
 	Bytes    int64  `json:"bytes,omitempty"`
 	Deadline int64  `json:"deadline,omitempty"`
+	SHA      string `json:"sha,omitempty"`  // repo
+	KB       int64  `json:"kb,omitempty"`   // repo checkout size
+	Secs     int64  `json:"secs,omitempty"` // repo checkout time
 }
 
 type Proc struct {
@@ -147,6 +150,10 @@ func (w *Watcher) Feed(line string) (*MonitorRecord, []string) {
 		ev = append(ev, "artifacts uploaded ("+humanBytes(float64(rec.Bytes))+" compressed); get them with `kiln artifacts`")
 	case "inputs":
 		ev = append(ev, "inputs unpacked into /kiln/inputs ("+humanBytes(float64(rec.Bytes))+" compressed)")
+	case "repo":
+		ev = append(ev, fmt.Sprintf("repo checked out at /kiln/src (%s, %s in %ds)", rec.SHA[:min(12, len(rec.SHA))], humanBytes(float64(rec.KB)*1024), rec.Secs))
+	case "repo_failed":
+		ev = append(ev, "repo checkout failed; the agent was not started: "+rec.Line)
 	case "inputs_failed":
 		ev = append(ev, "inputs download failed; the agent was not started")
 	case "upload_failed":

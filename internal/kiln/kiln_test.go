@@ -23,7 +23,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Backend != "docker" || c.Budget.MaxUSD != 5 || c.Budget.MaxHours != 1 || c.Budget.WarnAt != 0.8 ||
+	if c.Backend != "aws" || c.Budget.MaxUSD != 5 || c.Budget.MaxHours != 1 || c.Budget.WarnAt != 0.8 ||
 		c.Resources.CPU != 1 || c.Resources.MemoryGB != 2 {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
@@ -146,8 +146,9 @@ func TestContainerRunArgs(t *testing.T) {
 		Env: map[string]string{"B": "2", "A": "1"}, Secrets: []string{"TOKEN"},
 		Resources: Resources{CPU: 0.5, MemoryGB: 1.5},
 	}}
-	got := strings.Join(Container{Bin: "docker"}.runArgs(r), " ")
-	want := "run -d --name kiln-r_1 --label kiln.run=r_1 --cpus 0.5 --memory 1536m -e A=1 -e B=2 -e TOKEN alpine echo hi"
+	got := strings.Join(Container{Bin: "docker"}.runArgs(r, "/home/u/kiln/runs/r_1-kiln"), " ")
+	want := "run -d --name kiln-r_1 --label kiln.run=r_1 --cpus 0.5 --memory 1536m -v /home/u/kiln/runs/r_1-kiln:/kiln " +
+		"-e KILN_RUN_ID=r_1 -e KILN_DIR=/kiln -e A=1 -e B=2 -e TOKEN alpine echo hi"
 	if got != want {
 		t.Fatalf("\ngot  %s\nwant %s", got, want)
 	}

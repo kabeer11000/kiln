@@ -3,6 +3,7 @@ package kiln
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -95,8 +96,8 @@ func TestSupervisorOutcomes(t *testing.T) {
 	}{
 		{"succeeds", fake{exitAfter: 30 * time.Second, exitState: Succeeded}, roomy, 1, Succeeded, "exited"},
 		{"fails", fake{exitAfter: 30 * time.Second, exitState: Failed}, roomy, 1, Failed, "exited"},
-		{"dollar cap", fake{}, Budget{MaxUSD: 1, MaxHours: 10, WarnAt: 0.8}, 10, BudgetExceeded, "spent $1.00 of $1.00 cap"},
-		{"hour cap", fake{}, Budget{MaxUSD: 100, MaxHours: 0.5, WarnAt: 0.8}, 0, TimedOut, "ran 30m0s, cap is 0.5h"},
+		{"dollar cap", fake{}, Budget{MaxUSD: 1, MaxHours: 10, WarnAt: 0.8}, 10, BudgetExceeded, "reached the $1.00 cap (spent $1.00 so far)"},
+		{"hour cap", fake{}, Budget{MaxUSD: 100, MaxHours: 0.5, WarnAt: 0.8}, 0, TimedOut, "reached the 0.5h cap (ran 30m0s)"},
 		{"start error", fake{startErr: errors.New("no image")}, roomy, 1, Failed, "start failed: no image"},
 		{"lost backend", fake{statusErr: errors.New("gone")}, roomy, 1, Failed, "lost contact with backend: gone"},
 	}
@@ -149,7 +150,7 @@ func TestSlowBackendDoesNotDelayCap(t *testing.T) {
 	sup, r := setup(t, f, Budget{MaxUSD: 100, MaxHours: 0.006, WarnAt: 0.8}, 0)
 	f.slow = 10 * time.Second
 	_ = sup.Run(context.Background(), r)
-	if r.State != TimedOut || r.Reason != "ran 22s, cap is 0.006h" {
+	if r.State != TimedOut || r.Reason != "reached the 0.006h cap (ran 22s)" {
 		t.Fatalf("state %s %q", r.State, r.Reason)
 	}
 }
@@ -296,3 +297,84 @@ func TestSupervisorRecordsMonitorEvents(t *testing.T) {
 		t.Errorf("monitor records not saved: %v %s", err, b)
 	}
 }
+
+func TestCancelBeforeStartNeverStartsTask(t *testing.T) {
+	f := &fake{exitAfter: time.Hour, exitState: Succeeded}
+	sup, r := setup(t, f, Budget{MaxUSD: 1, MaxHours: 1, WarnAt: 0.8}, 0)
+	if err := sup.Store.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Store.RequestCancel(r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Run(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if r.State != Cancelled || !f.started.IsZero() || r.Handle != "" {
+		t.Errorf("state %s, started %v, handle %q: a run cancelled while queued must not start", r.State, f.started, r.Handle)
+	}
+}
+
+// reserving wraps the fake with a billed shutdown time, like aws.
+type reserving struct{ *fake }
+
+func (reserving) StopReserve() time.Duration { return 40 * time.Second }
+
+func TestStopReserveStopsEarly(t *testing.T) {
+	// $1 cap at $36/h = 100s. With a 40s billed shutdown, kiln must stop at 60s of running.
+	f := &fake{}
+	sup, r := setup(t, f, Budget{MaxUSD: 1, MaxHours: 10, WarnAt: 0.8}, 36)
+	sup.Backend = reserving{f}
+	_ = sup.Run(context.Background(), r)
+	if d := r.Duration(time.Time{}); r.State != BudgetExceeded || d < 60*time.Second || d > 61*time.Second {
+		t.Fatalf("state %s after %s, want budget_exceeded at 60s (100s cap - 40s shutdown)", r.State, d)
+	}
+	if !strings.Contains(r.Reason, "stopping 40s early") {
+		t.Errorf("reason should say why it stopped early: %q", r.Reason)
+	}
+}
+
+// The live stream skipped a reading, so it saw the process exit one reading later than the
+// replay does. The exit must still be recorded exactly once.
+func TestMonitorGapDoesNotDuplicateEvents(t *testing.T) {
+	f := &fake{exitAfter: 20 * time.Second, exitState: Succeeded}
+	sup, r := setup(t, f, Budget{MaxUSD: 1, MaxHours: 1, WarnAt: 0.8}, 0)
+	snap := func(tm int, procs string) string {
+		return fmt.Sprintf(`{"kiln":"snapshot","t":%d,"procs":[%s]}`+"\n", tm, procs)
+	}
+	goProc := `{"pid":96,"name":"go","state":"S","rss_kb":30000}`
+	full := snap(1, goProc) + snap(2, goProc) + snap(3, "") + snap(4, "")
+	live := snap(1, goProc) + snap(2, goProc) + snap(4, "") // missed t=3
+	sup.Backend = &gapObserver{fake: f, live: live, full: full}
+	if err := sup.Run(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range r.Events {
+		if strings.Contains(e.Message, "process go (pid 96) exited") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("exit recorded %d times, want 1", n)
+	}
+}
+
+type gapObserver struct {
+	*fake
+	live, full string
+}
+
+func (o *gapObserver) Monitor(ctx context.Context, _ string, follow bool, w io.Writer) error {
+	if !follow {
+		_, err := io.WriteString(w, o.full)
+		return err
+	}
+	io.WriteString(w, o.live)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (o *gapObserver) Send(context.Context, *Run, string) error { return nil }
+
+func (o *gapObserver) Artifacts(context.Context, *Run) ([]byte, error) { return nil, nil }

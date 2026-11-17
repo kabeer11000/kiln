@@ -62,7 +62,9 @@ type Run struct {
 	GitSHA       string     `json:"git_sha,omitempty"`
 	GitDirty     bool       `json:"git_dirty,omitempty"`
 	Inputs       *Inputs    `json:"inputs,omitempty"`
+	Repo         *RepoInfo  `json:"repo,omitempty"`     // the exact commit checked out at /kiln/src
 	RerunOf      string     `json:"rerun_of,omitempty"` // run this one reproduces (same image digest, same inputs)
+	Dir          string     `json:"dir,omitempty"`      // folder it was started from
 	Handle       string     `json:"handle,omitempty"`
 	PricePerHour float64    `json:"price_per_hour"`
 	SpentUSD     float64    `json:"spent_usd"`

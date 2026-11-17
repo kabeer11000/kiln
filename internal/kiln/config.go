@@ -23,7 +23,10 @@ type Config struct {
 	Command   []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 	Secrets   []string          `yaml:"secrets,omitempty" json:"secrets,omitempty"`
-	Inputs    []string          `yaml:"inputs,omitempty" json:"inputs,omitempty"` // files/dirs copied to /kiln/inputs
+	Inputs    []string          `yaml:"inputs,omitempty" json:"inputs,omitempty"`   // files/dirs copied to /kiln/inputs
+	Exclude   []string          `yaml:"exclude,omitempty" json:"exclude,omitempty"` // glob patterns left out of inputs
+	Repo      *RepoConfig       `yaml:"repo,omitempty" json:"repo,omitempty"`       // git repo checked out at /kiln/src
+	Workdir   string            `yaml:"workdir,omitempty" json:"workdir,omitempty"` // command's folder; default /kiln/src with repo
 	Budget    Budget            `yaml:"budget" json:"budget"`
 	Resources Resources         `yaml:"resources" json:"resources"`
 	AWS       *AWSConfig        `yaml:"aws,omitempty" json:"aws,omitempty"`
@@ -72,7 +75,7 @@ func LoadConfig(path string) (Config, error) {
 		if errors.Is(err, io.EOF) {
 			msg = "file is empty"
 		}
-		return Config{}, &Error{Code: "invalid_config", Message: path + ": " + msg, Fix: "check field names against SPEC.md"}
+		return Config{}, &Error{Code: "invalid_config", Message: path + ": " + msg, Fix: "`kiln schema` lists every field; `kiln init` writes a commented example"}
 	}
 	c.applyDefaults()
 	return c, c.Validate()
@@ -81,7 +84,7 @@ func LoadConfig(path string) (Config, error) {
 // applyDefaults fills zero values. A cap can never be turned off: 0 means "use the default".
 func (c *Config) applyDefaults() {
 	if c.Backend == "" {
-		c.Backend = "docker"
+		c.Backend = "aws" // runs never need docker on your machine
 	}
 	if c.Budget.MaxUSD == 0 {
 		c.Budget.MaxUSD = 5
@@ -97,6 +100,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Resources.MemoryGB == 0 {
 		c.Resources.MemoryGB = 2
+	}
+	if c.Repo != nil && c.Workdir == "" {
+		c.Workdir = repoDir
 	}
 	if c.Backend == "aws" {
 		if c.AWS == nil {
@@ -161,6 +167,20 @@ func (c Config) Validate() error {
 		if _, dup := c.Env[s]; dup {
 			add("secrets: %q is also set in env; secret values must not be stored in config", s)
 		}
+	}
+	if c.Repo != nil {
+		if strings.TrimSpace(c.Repo.URL) == "" {
+			add("repo.url: required, e.g. https://github.com/acme/app.git")
+		}
+		if c.Repo.Token != "" && !envRe.MatchString(c.Repo.Token) {
+			add("repo.token: the NAME of a secret holding the token (e.g. GITHUB_TOKEN), not the token itself")
+		}
+		if c.Repo.Token != "" && !strings.HasPrefix(c.Repo.URL, "https://") {
+			add("repo.token: only works with https:// URLs")
+		}
+	}
+	if c.Workdir != "" && !strings.HasPrefix(c.Workdir, "/") {
+		add("workdir: must be an absolute path inside the container, e.g. /kiln/src")
 	}
 	if len(p) > 0 {
 		return &Error{Code: "invalid_config", Message: strings.Join(p, "; "), Fix: "edit kiln.yaml, then run `kiln validate`"}

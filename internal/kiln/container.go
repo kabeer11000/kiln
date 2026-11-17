@@ -10,34 +10,44 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Container runs on a local docker or podman via their CLI (both share the same flags).
 type Container struct{ Bin string }
 
 func (c Container) Preflight(_ context.Context, cfg Config) error {
-	if len(cfg.Inputs) > 0 {
-		return &Error{Code: "not_supported", Message: "inputs: is not supported on the " + c.Bin + " backend yet", Fix: "use backend: aws, or COPY the files into your image"}
-	}
 	return cfg.CheckSecrets(os.LookupEnv)
 }
 
 func (c Container) Start(ctx context.Context, r *Run) (string, error) {
 	name := "kiln-" + r.ID
-	if _, err := c.exec(ctx, c.runArgs(r)...); err != nil {
+	dir, err := c.prepare(r)
+	if err != nil {
+		return "", err
+	}
+	if _, err := c.exec(ctx, c.runArgs(r, dir)...); err != nil {
 		_ = c.Remove(context.Background(), name) // `run` can leave a created container behind
 		return "", err
 	}
 	return name, nil
 }
 
-func (c Container) runArgs(r *Run) []string {
+func (c Container) runArgs(r *Run, kilnDir string) []string {
 	cfg := r.Config
 	args := []string{"run", "-d",
 		"--name", "kiln-" + r.ID,
 		"--label", "kiln.run=" + r.ID,
 		"--cpus", strconv.FormatFloat(cfg.Resources.CPU, 'f', -1, 64),
 		"--memory", fmt.Sprintf("%dm", int(cfg.Resources.MemoryGB*1024)),
+		"-v", kilnDir + ":/kiln",
+		"-e", "KILN_RUN_ID=" + r.ID, "-e", "KILN_DIR=/kiln",
+	}
+	if cfg.Workdir != "" {
+		args = append(args, "-w", cfg.Workdir)
+	}
+	if r.Repo != nil {
+		args = append(args, "-e", "KILN_REPO_SHA="+r.Repo.SHA)
 	}
 	for _, k := range slices.Sorted(maps.Keys(cfg.Env)) {
 		args = append(args, "-e", k+"="+cfg.Env[k])
@@ -101,6 +111,9 @@ func ignoreGone(_ string, err error) error {
 	}
 	return err
 }
+
+// StopReserve: `docker stop -t 10` can take up to 10s.
+func (c Container) StopReserve() time.Duration { return 10 * time.Second }
 
 // PricePerHour is 0 locally: your own machine. Use budget.price_per_hour to test caps.
 func (c Container) PricePerHour(Resources) float64 { return 0 }

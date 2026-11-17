@@ -27,7 +27,7 @@ func writeTree(t *testing.T, files map[string]string) string {
 func TestPackInputs(t *testing.T) {
 	src := writeTree(t, map[string]string{"data/a.csv": "1,2", "data/sub/b.txt": "b", "prompt.md": "do it"})
 	out := t.TempDir()
-	in, err := PackInputs(src, []string{"data", "prompt.md"}, filepath.Join(out, "1.tgz"))
+	in, err := PackInputs(src, []string{"data", "prompt.md"}, nil, filepath.Join(out, "1.tgz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,12 +38,12 @@ func TestPackInputs(t *testing.T) {
 	// Deterministic: same files, later mtimes -> same hash. That is what makes runs comparable.
 	later := time.Now().Add(time.Hour)
 	os.Chtimes(filepath.Join(src, "prompt.md"), later, later)
-	again, err := PackInputs(src, []string{"data", "prompt.md"}, filepath.Join(out, "2.tgz"))
+	again, err := PackInputs(src, []string{"data", "prompt.md"}, nil, filepath.Join(out, "2.tgz"))
 	if err != nil || again.SHA256 != in.SHA256 {
 		t.Errorf("same files must give the same sha256: %v vs %v (%v)", in.SHA256, again.SHA256, err)
 	}
 	os.WriteFile(filepath.Join(src, "prompt.md"), []byte("do something else"), 0o644)
-	if changed, _ := PackInputs(src, []string{"data", "prompt.md"}, filepath.Join(out, "3.tgz")); changed.SHA256 == in.SHA256 {
+	if changed, _ := PackInputs(src, []string{"data", "prompt.md"}, nil, filepath.Join(out, "3.tgz")); changed.SHA256 == in.SHA256 {
 		t.Error("changed content must change the sha256")
 	}
 
@@ -61,10 +61,10 @@ func TestPackInputs(t *testing.T) {
 func TestPackInputsErrors(t *testing.T) {
 	src := writeTree(t, map[string]string{"a/x": "1", "b/x/y": "2"})
 	out := filepath.Join(t.TempDir(), "i.tgz")
-	if _, err := PackInputs(src, []string{"missing"}, out); err == nil || !strings.Contains(err.Error(), "input not found") {
+	if _, err := PackInputs(src, []string{"missing"}, nil, out); err == nil || !strings.Contains(err.Error(), "input not found") {
 		t.Errorf("missing path: %v", err)
 	}
-	if _, err := PackInputs(src, []string{"a/x", "b/x"}, out); err == nil || !strings.Contains(err.Error(), "both unpack") {
+	if _, err := PackInputs(src, []string{"a/x", "b/x"}, nil, out); err == nil || !strings.Contains(err.Error(), "both unpack") {
 		t.Errorf("two inputs with the same base name must be refused: %v", err)
 	}
 }
@@ -101,5 +101,41 @@ func TestTaskDefinitionInputsGate(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %s", want)
 		}
+	}
+}
+
+// The v1.1 bug: inputs: ["."] packed .kiln/ while writing the archive into it.
+func TestPackInputsDotExcludesKilnAndGit(t *testing.T) {
+	src := writeTree(t, map[string]string{
+		"main.go": "package main", "src/app.ts": "x", ".git/HEAD": "ref", ".kiln/runs/old.json": "{}",
+		"node_modules/pkg/index.js": "big", "debug.log": "noise", "src/keep.log.txt": "kept",
+	})
+	dest := filepath.Join(src, ".kiln", "runs", "r_new.inputs.tgz") // archive inside the packed folder
+	in, err := PackInputs(src, []string{"."}, []string{"node_modules", "*.log"}, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(dest)
+	out := t.TempDir()
+	if _, err := ExtractArtifacts(data, out); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	filepath.WalkDir(out, func(p string, d os.DirEntry, _ error) error {
+		if !d.IsDir() {
+			rel, _ := filepath.Rel(out, p)
+			got = append(got, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	want := "main.go,src/app.ts,src/keep.log.txt"
+	if strings.Join(got, ",") != want || in.Files != 3 {
+		t.Errorf(`"." packed %v (%d files), want %s at the top of /kiln/inputs`, got, in.Files, want)
+	}
+	if _, err := PackInputs(src, []string{".", "main.go"}, nil, dest); err == nil {
+		t.Error(`"." combined with other inputs must be refused`)
+	}
+	if _, err := PackInputs(src, []string{"."}, []string{"[bad"}, dest); err == nil {
+		t.Error("a malformed exclude pattern must be refused")
 	}
 }

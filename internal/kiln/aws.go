@@ -26,8 +26,11 @@ const (
 	fargateSpotGBHour   = 0.00142
 	publicIPv4Hour      = 0.005
 
+	// awsStopReserve is how long stopping a task takes, all billed: the agent's 10s to exit,
+	// the monitor's final reading and upload, and ECS tearing the task down (measured 16-50s).
+	awsStopReserve = 60 * time.Second
 	// deadlineGrace lets the supervisor stop the task first; the in-task deadline is the backstop.
-	deadlineGrace = 60
+	deadlineGrace = 15
 	monitorImage  = "public.ecr.aws/docker/library/alpine:3.20"
 	agentName     = "agent"
 	monitorName   = "kiln-monitor"
@@ -93,7 +96,11 @@ func (a *AWS) Preflight(ctx context.Context, c Config) error {
 		return err
 	}
 	var missing []string
-	for chunk := range slices.Chunk(c.Secrets, 10) { // GetParameters takes at most 10 names
+	names := slices.Clone(c.Secrets)
+	if c.Repo != nil && c.Repo.Token != "" {
+		names = append(names, c.Repo.Token)
+	}
+	for chunk := range slices.Chunk(names, 10) { // GetParameters takes at most 10 names
 		args := []string{"ssm", "get-parameters", "--query", "InvalidParameters", "--names"}
 		for _, s := range chunk {
 			args = append(args, inf.SecretsPrefix+s)
@@ -281,6 +288,9 @@ func (a *AWS) taskDefinition(r *Run, inf *awsInfra, urls map[string]string) (map
 	if len(c.Command) > 0 {
 		agent["command"] = c.Command
 	}
+	if c.Workdir != "" {
+		agent["workingDirectory"] = c.Workdir
+	}
 	// The monitor is essential: when it exits at the hard deadline, ECS stops the whole task.
 	// This enforces the caps inside AWS even if the machine running `kiln run` goes away.
 	// It shares the task's process namespace (pidMode task) so it sees every agent process.
@@ -288,8 +298,18 @@ func (a *AWS) taskDefinition(r *Run, inf *awsInfra, urls map[string]string) (map
 	for _, k := range slices.Sorted(maps.Keys(urls)) {
 		monEnv = append(monEnv, map[string]string{"name": k, "value": urls[k]})
 	}
+	monSecrets := []map[string]string{}
+	if r.Repo != nil {
+		monEnv = append(monEnv, map[string]string{"name": "KILN_REPO_URL", "value": r.Repo.URL},
+			map[string]string{"name": "KILN_REPO_SHA", "value": r.Repo.SHA})
+		env = append(env, map[string]string{"name": "KILN_REPO_SHA", "value": r.Repo.SHA})
+		agent["environment"] = env
+		if c.Repo != nil && c.Repo.Token != "" {
+			monSecrets = append(monSecrets, map[string]string{"name": "KILN_REPO_TOKEN", "valueFrom": inf.SecretsPrefix + c.Repo.Token})
+		}
+	}
 	monitor := map[string]any{
-		"name": monitorName, "image": monitorImage, "essential": true,
+		"name": monitorName, "image": monitorImage, "essential": true, "secrets": monSecrets,
 		"stopTimeout": 30,                                                                // time for the final reading and the artifact upload
 		"command":     []string{"sh", "-c", strings.ReplaceAll(monitorScript, "\r", "")}, // CRLF breaks sh
 		"environment": monEnv, "mountPoints": mount, "logConfiguration": logs,
@@ -311,18 +331,24 @@ func (a *AWS) taskDefinition(r *Run, inf *awsInfra, urls map[string]string) (map
 	}, nil
 }
 
-// deadlineSeconds is the hard wall-clock limit: the hour cap, or the time the dollar cap is
-// reached at this price, whichever is sooner, plus grace for the supervisor to act first.
+// deadlineSeconds is the in-task hard limit: the hour cap, or the time the dollar cap is
+// reached at this price, whichever is sooner, minus the billed shutdown time, plus a little
+// grace so the supervisor (if alive) acts first.
 func deadlineSeconds(b Budget, pricePerHour float64) int {
 	secs := b.MaxHours * 3600
 	if pricePerHour > 0 {
 		secs = min(secs, b.MaxUSD/pricePerHour*3600)
 	}
-	return int(math.Ceil(secs)) + deadlineGrace
+	return max(int(math.Ceil(secs-awsStopReserve.Seconds()))+deadlineGrace, deadlineGrace)
 }
+
+func (a *AWS) StopReserve() time.Duration { return awsStopReserve }
 
 type ecsTask struct {
 	LastStatus        string `json:"lastStatus"`
+	PullStartedAt     string `json:"pullStartedAt"` // Fargate billing starts here
+	CreatedAt         string `json:"createdAt"`
+	StoppedAt         string `json:"stoppedAt"`
 	StoppedReason     string `json:"stoppedReason"`
 	TaskDefinitionArn string `json:"taskDefinitionArn"`
 	Containers        []struct {
@@ -367,6 +393,11 @@ func (a *AWS) Status(ctx context.Context, handle string) (Status, error) {
 
 func (t ecsTask) status() Status {
 	var st Status
+	st.BilledFrom = awsTime(t.PullStartedAt)
+	if st.BilledFrom.IsZero() {
+		st.BilledFrom = awsTime(t.CreatedAt)
+	}
+	st.BilledTo = awsTime(t.StoppedAt)
 	agentExit, deadlineExit := -1, -1
 	var agentReason string
 	for _, c := range t.Containers {
@@ -611,4 +642,13 @@ func fargateSize(cpu, memGB float64) (int, int, error) {
 	}
 	return 0, 0, &Error{Code: "invalid_resources", Message: fmt.Sprintf("no Fargate size fits cpu %g, memory_gb %g", cpu, memGB),
 		Fix: "Fargate allows up to 16 vCPU / 120 GB"}
+}
+
+// awsTime parses the CLI's timestamps ("2026-11-17T18:58:53.337000+05:00"); zero if absent.
+func awsTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }

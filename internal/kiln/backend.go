@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Error is the one error shape for humans and agents: what went wrong and how to fix it.
@@ -23,6 +24,22 @@ type Status struct {
 	State       State  // Running, Succeeded, Failed or TimedOut
 	ImageDigest string // once known
 	Reason      string // why it stopped, if it did
+	// BilledFrom/BilledTo are the provider's own timestamps for the billed period, when it
+	// reports them (aws). They make the final recorded spend match the bill.
+	BilledFrom, BilledTo time.Time
+}
+
+// StopReserver is a backend whose shutdown takes a while and is billed. Caps are enforced
+// that much early, so the total including shutdown stays within the cap.
+type StopReserver interface {
+	StopReserve() time.Duration
+}
+
+func StopReserveOf(b Backend) time.Duration {
+	if r, ok := b.(StopReserver); ok {
+		return r.StopReserve()
+	}
+	return 0
 }
 
 // Backend runs one task somewhere. Everything else in kiln is backend-agnostic.
