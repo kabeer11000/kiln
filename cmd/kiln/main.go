@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -25,12 +27,21 @@ usage: kiln <command> [flags] [--json]
 commands:
   init                      write a starter kiln.yaml
   validate [-f file]        check config, print it with defaults
-  run [-f file] [--plan]    start and supervise a run (--plan: show cost, don't start)
+  run [-f file] [--plan] [-d]
+                            start and supervise a run (--plan: show cost, don't start;
+                            -d: start in the background and return the run id)
+  rerun <run> [-d]          run again with the same image digest and identical inputs
+  wait <run>                block until a run ends; exit code is its outcome
   list                      all runs, newest first
   status <run>              one run (id, id prefix, or name)
   logs <run> [-f]           run logs
   cancel <run>              stop a run
   diff <a> <b>              what changed between two runs
+  top <run> [-f] [-n N]     live view inside a run: processes, CPU, memory, network,
+                            connections, disk, crashes, agent messages (aws)
+  send <run> <message>      send a message to the running agent (/kiln/inbox.jsonl) (aws)
+  artifacts <run> [-o dir]  download files the agent left in /kiln/artifacts (aws)
+  serve [--addr host:port]  local HTTP API for all of the above (default 127.0.0.1:7777)
   version                   print the kiln version
 
 every command accepts --json for machine-readable output.
@@ -43,6 +54,14 @@ type app struct {
 	out   io.Writer
 	json  bool
 	store kiln.Store
+	ctx   context.Context // nil = background; the API sets the request's context
+}
+
+func (a *app) context() context.Context {
+	if a.ctx == nil {
+		return context.Background()
+	}
+	return a.ctx
 }
 
 func main() {
@@ -60,6 +79,8 @@ func (a *app) main(args []string) int {
 	handlers := map[string]func([]string) (int, error){
 		"init": a.cmdInit, "validate": a.cmdValidate, "run": a.cmdRun, "list": a.cmdList,
 		"status": a.cmdStatus, "logs": a.cmdLogs, "cancel": a.cmdCancel, "diff": a.cmdDiff,
+		"top": a.cmdTop, "send": a.cmdSend, "artifacts": a.cmdArtifacts, "serve": a.cmdServe,
+		"rerun": a.cmdRerun, "wait": a.cmdWait, "_supervise": a.cmdSupervise,
 	}
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(a.out, usage)
@@ -120,6 +141,7 @@ func (a *app) cmdRun(args []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	file := fs.String("f", kiln.DefaultFile, "config file")
 	plan := fs.Bool("plan", false, "show price and max spend without starting")
+	detach := fs.Bool("d", false, "start in the background and return the run id")
 	if _, err := a.parseFS(fs, args, 0); err != nil {
 		return 2, err
 	}
@@ -149,7 +171,32 @@ func (a *app) cmdRun(args []string) (int, error) {
 		})
 		return 0, nil
 	}
+	if len(c.Inputs) > 0 {
+		r.Inputs, err = kiln.PackInputs(filepath.Dir(*file), c.Inputs, a.store.InputsPath(r.ID))
+		if err != nil {
+			return 1, err
+		}
+	}
+	return a.start(r, b, *detach)
+}
 
+// start supervises r in this process, or with detach hands it to a background kiln process
+// (output in .kiln/runs/<id>.out) and returns at once. Caps hold either way: on aws the
+// in-task deadline stops the task even if no kiln process is left.
+func (a *app) start(r *kiln.Run, b kiln.Backend, detach bool) (int, error) {
+	if detach {
+		if err := a.store.Save(r); err != nil {
+			return 1, err
+		}
+		if err := spawnSupervisor(a.store, r.ID); err != nil {
+			return 1, err
+		}
+		a.emit(map[string]any{"id": r.ID, "name": r.Name, "state": r.State, "detached": true}, func() {
+			fmt.Fprintf(a.out, "started %s (%s) in the background\n  watch: kiln top %s -f\n  wait:  kiln wait %s\n  stop:  kiln cancel %s\n",
+				r.Name, r.ID, r.ID, r.ID, r.ID)
+		})
+		return 0, nil
+	}
 	sup := kiln.NewSupervisor(b, a.store)
 	if !a.json {
 		fmt.Fprintf(a.out, "run %s (%s)\n", r.Name, r.ID)
@@ -159,11 +206,83 @@ func (a *app) cmdRun(args []string) (int, error) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	err = sup.Run(ctx, r)
+	err := sup.Run(ctx, r)
 	a.emit(r, func() {
 		fmt.Fprintf(a.out, "%s: %s, spent $%.4f, ran %s\n", r.ID, r.State, r.SpentUSD, r.Duration(time.Now()).Round(time.Second))
 	})
 	return r.State.ExitCode(), err
+}
+
+// cmdSupervise is the background half of `run -d`: it supervises a run that was already recorded.
+func (a *app) cmdSupervise(args []string) (int, error) {
+	r, err := a.findArg("_supervise", args)
+	if err != nil {
+		return 1, err
+	}
+	if r.State != kiln.Queued {
+		return 1, &kiln.Error{Code: "already_started", Message: "run " + r.ID + " is " + string(r.State)}
+	}
+	b, err := kiln.BackendFor(r.Config)
+	if err != nil {
+		return 1, err
+	}
+	return a.start(r, b, false)
+}
+
+// cmdRerun starts a new run that reproduces an old one: same config, the exact image digest
+// the old run used (not the tag, which may have moved), and byte-identical inputs.
+func (a *app) cmdRerun(args []string) (int, error) {
+	fs := flag.NewFlagSet("rerun", flag.ContinueOnError)
+	detach := fs.Bool("d", false, "start in the background and return the run id")
+	pos, err := a.parseFS(fs, args, 1)
+	if err != nil {
+		return 2, err
+	}
+	old, err := a.store.Find(pos[0])
+	if err != nil {
+		return 1, err
+	}
+	c := old.Config
+	c.Image = kiln.PinImage(c.Image, old.ImageDigest)
+	b, err := kiln.BackendFor(c)
+	if err != nil {
+		return 1, err
+	}
+	if err := b.Preflight(a.context(), c); err != nil {
+		return 1, err
+	}
+	r := kiln.NewRun(c, time.Now())
+	r.PricePerHour = kiln.PriceFor(c, b)
+	r.GitSHA, r.GitDirty, r.Inputs, r.RerunOf = old.GitSHA, old.GitDirty, old.Inputs, old.ID
+	return a.start(r, b, *detach)
+}
+
+// cmdWait blocks until a run ends and exits with its state's exit code.
+func (a *app) cmdWait(args []string) (int, error) {
+	r, err := a.findArg("wait", args)
+	if err != nil {
+		return 1, err
+	}
+	ctx, stop := signal.NotifyContext(a.context(), os.Interrupt)
+	defer stop()
+	for !r.State.Terminal() {
+		if a.store.Stale(r, time.Now()) {
+			return 1, &kiln.Error{Code: "supervisor_gone", Message: "no kiln process is supervising " + r.ID,
+				Fix: "run `kiln cancel " + r.ID + "` to stop it and record how it ended"}
+		}
+		select {
+		case <-ctx.Done():
+			return 1, &kiln.Error{Code: "interrupted", Message: "stopped waiting; the run continues"}
+		case <-time.After(2 * time.Second):
+		}
+		if r, err = a.store.Load(r.ID); err != nil {
+			return 1, err
+		}
+	}
+	a.emit(r, func() {
+		fmt.Fprintf(a.out, "%s: %s (%s), spent $%.4f, ran %s\n", r.ID, r.State, r.Reason, r.SpentUSD, r.Duration(time.Now()).Round(time.Second))
+	})
+	return r.State.ExitCode(), nil
 }
 
 func (a *app) cmdList(args []string) (int, error) {
@@ -191,7 +310,7 @@ func (a *app) cmdStatus(args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	stale := !r.State.Terminal() && time.Since(r.UpdatedAt) > kiln.StaleAfter
+	stale := a.store.Stale(r, time.Now())
 	a.emit(map[string]any{"run": r, "stale": stale}, func() {
 		fmt.Fprintf(a.out, "%s  %s\n  state:   %s\n  spent:   $%.4f of $%g (at $%.4f/h)\n  ran:     %s of %gh\n",
 			r.ID, r.Name, r.State, r.SpentUSD, r.Config.Budget.MaxUSD, r.PricePerHour,
@@ -280,6 +399,153 @@ func (a *app) cmdDiff(args []string) (int, error) {
 		for _, c := range changes {
 			fmt.Fprintf(a.out, "%s: %v -> %v\n", c.Field, c.A, c.B)
 		}
+	})
+	return 0, nil
+}
+
+func (a *app) observer(r *kiln.Run) (kiln.Observer, error) {
+	b, err := kiln.BackendFor(r.Config)
+	if err != nil {
+		return nil, err
+	}
+	return kiln.ObserverFor(b, r.Config.Backend)
+}
+
+func (a *app) cmdTop(args []string) (int, error) {
+	fs := flag.NewFlagSet("top", flag.ContinueOnError)
+	follow := fs.Bool("f", false, "keep watching until the run ends")
+	n := fs.Int("n", 15, "processes to show")
+	pos, err := a.parseFS(fs, args, 1)
+	if err != nil {
+		return 2, err
+	}
+	r, err := a.store.Find(pos[0])
+	if err != nil {
+		return 1, err
+	}
+	o, err := a.observer(r)
+	if err != nil {
+		return 1, err
+	}
+	var src io.Reader
+	ctx, stop := signal.NotifyContext(a.context(), os.Interrupt)
+	defer stop()
+	if saved, err := os.ReadFile(a.store.MonitorPath(r.ID)); err == nil && r.State.Terminal() {
+		src = bytes.NewReader(saved)
+	} else if *follow && !r.State.Terminal() {
+		pr, pw := io.Pipe()
+		go func() { pw.CloseWithError(o.Monitor(ctx, r.Handle, true, pw)) }()
+		go func() { // the log stream never ends by itself: stop when the run does
+			for ctx.Err() == nil {
+				time.Sleep(3 * time.Second)
+				if cur, err := a.store.Load(r.ID); err == nil && cur.State.Terminal() {
+					stop()
+				}
+			}
+		}()
+		src = pr
+	} else {
+		var buf bytes.Buffer
+		if err := o.Monitor(ctx, r.Handle, false, &buf); err != nil {
+			return 1, err
+		}
+		src = &buf
+	}
+
+	w := &kiln.Watcher{}
+	var events []string
+	onEvent := func(e string) {
+		events = append(events, e)
+		if *follow && !a.json {
+			fmt.Fprintln(a.out, "event:", e)
+		}
+	}
+	onRecord := func(rec *kiln.MonitorRecord) {
+		if !*follow {
+			return
+		}
+		if a.json { // one JSON object per line, CPU% filled in, as it happens
+			_ = json.NewEncoder(a.out).Encode(rec)
+		} else if rec.Kind == "snapshot" || rec.Kind == "final" {
+			w.View.Render(a.out, *n)
+		}
+	}
+	if *follow && a.json {
+		onEvent = func(e string) { _ = json.NewEncoder(a.out).Encode(map[string]string{"kiln": "event", "message": e}) }
+	}
+	err = kiln.WatchMonitor(src, w, onEvent, onRecord)
+	if ctx.Err() != nil {
+		err = nil // Ctrl-C, client gone, or the run ended
+	}
+	if *follow || err != nil {
+		if cur, lerr := a.store.Load(r.ID); err == nil && lerr == nil && cur.State.Terminal() && !a.json {
+			fmt.Fprintf(a.out, "run %s ended: %s (%s)\n", cur.ID, cur.State, cur.Reason)
+		}
+		return 0, err
+	}
+	a.emit(map[string]any{"id": r.ID, "state": r.State, "view": w.View, "events": orEmpty(events)}, func() {
+		fmt.Fprintf(a.out, "%s  %s  %s\n", r.ID, r.Name, r.State)
+		for _, e := range events {
+			fmt.Fprintln(a.out, "event:", e)
+		}
+		w.View.Render(a.out, *n)
+	})
+	return 0, nil
+}
+
+func (a *app) cmdSend(args []string) (int, error) {
+	pos, err := a.parse("send", args, 2)
+	if err != nil {
+		return 2, err
+	}
+	r, err := a.store.Find(pos[0])
+	if err != nil {
+		return 1, err
+	}
+	if r.State.Terminal() {
+		return 1, &kiln.Error{Code: "already_finished", Message: "run " + r.ID + " already " + string(r.State)}
+	}
+	o, err := a.observer(r)
+	if err != nil {
+		return 1, err
+	}
+	if err := o.Send(a.context(), r, pos[1]); err != nil {
+		return 1, err
+	}
+	a.emit(map[string]any{"id": r.ID, "sent": pos[1]}, func() {
+		fmt.Fprintf(a.out, "sent to %s; the agent sees it in /kiln/inbox.jsonl within a few seconds\n", r.ID)
+	})
+	return 0, nil
+}
+
+func (a *app) cmdArtifacts(args []string) (int, error) {
+	fs := flag.NewFlagSet("artifacts", flag.ContinueOnError)
+	dir := fs.String("o", "", "directory to unpack into (default .kiln/runs/<id>-artifacts)")
+	pos, err := a.parseFS(fs, args, 1)
+	if err != nil {
+		return 2, err
+	}
+	r, err := a.store.Find(pos[0])
+	if err != nil {
+		return 1, err
+	}
+	o, err := a.observer(r)
+	if err != nil {
+		return 1, err
+	}
+	data, err := o.Artifacts(a.context(), r)
+	if err != nil {
+		return 1, err
+	}
+	if *dir == "" {
+		*dir = a.store.ArtifactsDir(r.ID)
+	}
+	n, err := kiln.ExtractArtifacts(data, *dir)
+	if err != nil {
+		return 1, err
+	}
+	a.emit(map[string]any{"id": r.ID, "dir": *dir, "files": n}, func() {
+		fmt.Fprintf(a.out, "%d file(s) in %s (artifacts/ plus the agent's outbox.jsonl and inbox.jsonl)\n", n, *dir)
 	})
 	return 0, nil
 }

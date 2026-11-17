@@ -20,6 +20,18 @@ func (s Store) path(id, ext string) string { return filepath.Join(s.Dir, id+ext)
 
 func (s Store) LogPath(id string) string { return s.path(id, ".log") }
 
+// InputsPath is the packed inputs archive. Kept so `kiln rerun` sends byte-identical files.
+func (s Store) InputsPath(id string) string { return s.path(id, ".inputs.tgz") }
+
+// OutPath is the output of a background (`run -d`) supervisor.
+func (s Store) OutPath(id string) string { return s.path(id, ".out") }
+
+// MonitorPath holds the monitor's JSON records (procs, memory, network, messages), saved at the end.
+func (s Store) MonitorPath(id string) string { return s.path(id, ".monitor.jsonl") }
+
+// ArtifactsDir is where `kiln artifacts` unpacks a run's files.
+func (s Store) ArtifactsDir(id string) string { return s.path(id, "-artifacts") }
+
 // Save writes atomically so concurrent readers (`kiln status`) never see a partial file.
 func (s Store) Save(r *Run) error {
 	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
@@ -96,6 +108,29 @@ func (s Store) Find(ref string) (*Run, error) {
 		return hits[0], nil
 	}
 	return nil, &Error{Code: "ambiguous_run", Message: fmt.Sprintf("%d runs match %s", len(hits), ref), Fix: "use the full run id"}
+}
+
+// Heartbeat marks the run's supervisor as alive. It is a separate file so the supervisor can
+// prove it is alive while it's busy (e.g. waiting for a task to stop) without rewriting the record.
+func (s Store) Heartbeat(id string) error {
+	p := s.path(id, ".alive")
+	now := time.Now()
+	if err := os.Chtimes(p, now, now); err == nil {
+		return nil
+	}
+	return os.WriteFile(p, nil, 0o644)
+}
+
+// Stale reports whether nothing has supervised a not-yet-finished run for StaleAfter.
+func (s Store) Stale(r *Run, now time.Time) bool {
+	if r.State.Terminal() {
+		return false
+	}
+	last := r.UpdatedAt
+	if fi, err := os.Stat(s.path(r.ID, ".alive")); err == nil && fi.ModTime().After(last) {
+		last = fi.ModTime()
+	}
+	return now.Sub(last) > StaleAfter
 }
 
 func (s Store) RequestCancel(id string) error {

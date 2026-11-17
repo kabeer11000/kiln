@@ -23,6 +23,7 @@ type Config struct {
 	Command   []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 	Secrets   []string          `yaml:"secrets,omitempty" json:"secrets,omitempty"`
+	Inputs    []string          `yaml:"inputs,omitempty" json:"inputs,omitempty"` // files/dirs copied to /kiln/inputs
 	Budget    Budget            `yaml:"budget" json:"budget"`
 	Resources Resources         `yaml:"resources" json:"resources"`
 	AWS       *AWSConfig        `yaml:"aws,omitempty" json:"aws,omitempty"`
@@ -180,4 +181,17 @@ func (c Config) CheckSecrets(lookup func(string) (string, bool)) error {
 			Fix: "export " + missing[0] + "=... before running"}
 	}
 	return nil
+}
+
+// PinImage replaces image's tag with digest ("repo:tag" -> "repo@sha256:..."), so a rerun
+// uses exactly the image an earlier run did even if the tag has since moved.
+func PinImage(image, digest string) string {
+	if digest == "" || strings.Contains(image, "@") {
+		return image
+	}
+	repo := image
+	if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
+		repo = image[:i] // a colon after the last slash is a tag; before it, a registry port
+	}
+	return repo + "@" + digest
 }

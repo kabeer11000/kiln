@@ -39,6 +39,26 @@ type Backend interface {
 	PricePerHour(Resources) float64
 }
 
+// Observer is a backend that runs the kiln monitor next to the agent: live process, memory,
+// network and disk readings, messages in both directions, and artifacts. AWS only for now.
+type Observer interface {
+	// Monitor writes the monitor's JSON records, one per line (see MonitorRecord).
+	Monitor(ctx context.Context, handle string, follow bool, w io.Writer) error
+	// Send delivers a message to the agent's /kiln/inbox.jsonl.
+	Send(ctx context.Context, r *Run, msg string) error
+	// Artifacts returns the gzipped tar of /kiln/artifacts and the message logs, uploaded at stop.
+	Artifacts(ctx context.Context, r *Run) ([]byte, error)
+}
+
+// ObserverFor returns b's Observer, or an error naming the backends that have one.
+func ObserverFor(b Backend, backend string) (Observer, error) {
+	if o, ok := b.(Observer); ok {
+		return o, nil
+	}
+	return nil, &Error{Code: "not_supported", Message: "live monitoring, messages and artifacts are not available on the " + backend + " backend yet",
+		Fix: "use backend: aws"}
+}
+
 var backends = map[string]func(Config) Backend{
 	"docker": func(Config) Backend { return Container{Bin: "docker"} },
 	"podman": func(Config) Backend { return Container{Bin: "podman"} },

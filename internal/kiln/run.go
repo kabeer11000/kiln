@@ -61,6 +61,8 @@ type Run struct {
 	ImageDigest  string     `json:"image_digest,omitempty"`
 	GitSHA       string     `json:"git_sha,omitempty"`
 	GitDirty     bool       `json:"git_dirty,omitempty"`
+	Inputs       *Inputs    `json:"inputs,omitempty"`
+	RerunOf      string     `json:"rerun_of,omitempty"` // run this one reproduces (same image digest, same inputs)
 	Handle       string     `json:"handle,omitempty"`
 	PricePerHour float64    `json:"price_per_hour"`
 	SpentUSD     float64    `json:"spent_usd"`

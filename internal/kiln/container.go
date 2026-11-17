@@ -16,6 +16,9 @@ import (
 type Container struct{ Bin string }
 
 func (c Container) Preflight(_ context.Context, cfg Config) error {
+	if len(cfg.Inputs) > 0 {
+		return &Error{Code: "not_supported", Message: "inputs: is not supported on the " + c.Bin + " backend yet", Fix: "use backend: aws, or COPY the files into your image"}
+	}
 	return cfg.CheckSecrets(os.LookupEnv)
 }
 

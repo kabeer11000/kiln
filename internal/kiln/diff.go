@@ -32,6 +32,9 @@ func diffView(r *Run, now time.Time) map[string]any {
 		"state": r.State, "reason": r.Reason, "spent_usd": fmt.Sprintf("%.4f", r.SpentUSD),
 		"duration": r.Duration(now).Round(time.Second).String(),
 	}
+	if r.Inputs != nil {
+		v["inputs_sha256"] = r.Inputs.SHA256
+	}
 	// Round-trip through JSON so nested structs become maps with their json field names.
 	data, _ := json.Marshal(v)
 	var m map[string]any

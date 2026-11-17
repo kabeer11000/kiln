@@ -1,6 +1,7 @@
 # kiln on AWS: one-time setup per team account.
-# Creates only things that cost $0 while idle: ECS cluster, security group, IAM roles,
-# a log group, an SSM parameter with the settings kiln reads, and an optional budget alert.
+# Creates only things that cost $0 (or cents) while idle: ECS cluster, security group, IAM roles,
+# a log group, an S3 bucket for artifacts and messages (objects expire), an SSM parameter with
+# the settings kiln reads, and an optional budget alert.
 # No NAT gateway, no load balancer, no always-on compute.
 
 terraform {
@@ -27,6 +28,12 @@ variable "stack" {
 variable "log_retention_days" {
   type    = number
   default = 7
+}
+
+variable "artifact_retention_days" {
+  description = "Run artifacts and messages in S3 are deleted after this many days."
+  type        = number
+  default     = 30
 }
 
 variable "budget_usd" {
@@ -168,6 +175,21 @@ resource "aws_iam_policy" "users" {
         Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter"]
         Resource = [aws_ssm_parameter.config.arn, local.secrets_arn]
       },
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.signer.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.runs.arn}/runs/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.runs.arn
+      },
     ]
   })
 }
@@ -183,6 +205,71 @@ resource "aws_ssm_parameter" "config" {
     execution_role_arn = aws_iam_role.execution.arn
     log_group          = aws_cloudwatch_log_group.this.name
     secrets_prefix     = local.secrets_prefix
+    bucket             = aws_s3_bucket.runs.bucket
+    signer_parameter   = aws_ssm_parameter.signer.name
+  })
+}
+
+# Per-run artifacts, monitor uploads and the message inbox. Tasks have no AWS credentials;
+# kiln hands each task presigned URLs for its own run's objects only.
+resource "aws_s3_bucket" "runs" {
+  bucket        = "kiln-${var.stack}-${data.aws_caller_identity.me.account_id}-${var.region}"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_public_access_block" "runs" {
+  bucket                  = aws_s3_bucket.runs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "runs" {
+  bucket = aws_s3_bucket.runs.id
+  rule {
+    id     = "expire-runs"
+    status = "Enabled"
+    filter {
+      prefix = "runs/"
+    }
+    expiration {
+      days = var.artifact_retention_days
+    }
+  }
+}
+
+# Signs the presigned URLs. Team members' own credentials are often short-lived (SSO, MFA
+# sessions), and a URL dies with the credentials that signed it, so a run longer than the
+# session would lose its uploads. This key can only read/write run objects in the bucket.
+# Its secret is in the terraform state: keep the state private.
+resource "aws_iam_user" "signer" {
+  name = "kiln-${var.stack}-signer"
+}
+
+resource "aws_iam_user_policy" "signer" {
+  name = "run-objects-only"
+  user = aws_iam_user.signer.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:PutObject"]
+      Resource = "${aws_s3_bucket.runs.arn}/runs/*"
+    }]
+  })
+}
+
+resource "aws_iam_access_key" "signer" {
+  user = aws_iam_user.signer.name
+}
+
+resource "aws_ssm_parameter" "signer" {
+  name = "/kiln/${var.stack}/signer"
+  type = "SecureString"
+  value = jsonencode({
+    access_key_id     = aws_iam_access_key.signer.id
+    secret_access_key = aws_iam_access_key.signer.secret
   })
 }
 

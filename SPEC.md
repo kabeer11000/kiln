@@ -33,6 +33,7 @@ resources:
 
 env: {MODE: fast}              # stored in the run record
 secrets: [LLM_API_KEY]         # names only. docker: from your env. aws: from SSM. Never stored
+inputs: [./data, prompt.md]    # aws: unpacked to /kiln/inputs before the agent starts; sha256 recorded
 
 aws:                           # only with backend: aws
   region: us-east-1            # default us-east-1
@@ -70,7 +71,14 @@ Every command accepts `--json`. Errors are `{"error": {"code", "message", "fix"}
 | `kiln status <run>` | One run. `<run>` is an id, id prefix, or name |
 | `kiln logs <run> [-f]` | Logs (saved logs once finished) |
 | `kiln cancel <run>` | Stop a run |
-| `kiln diff <a> <b>` | What changed between two runs: config, image, git, outcome, cost |
+| `kiln diff <a> <b>` | What changed between two runs: config, image, inputs, git, outcome, cost |
+| `kiln run -d` | Start in the background (a detached `kiln _supervise <id>` process), print the id |
+| `kiln rerun <run> [-d]` | New run with the old config, image pinned to the old digest, same inputs archive |
+| `kiln wait <run>` | Block until terminal; exit code per the table above |
+| `kiln top <run> [-f] [-n N]` | Monitor view (aws). `--json -f`: one record per line |
+| `kiln send <run> <msg>` | Append `{"t","msg"}` to the run's inbox (aws) |
+| `kiln artifacts <run> [-o dir]` | Download and unpack the artifacts archive (aws) |
+| `kiln serve [--addr]` | Local HTTP API over the same handlers (see README) |
 
 ## Cost enforcement
 
@@ -127,11 +135,36 @@ that kiln reads, IAM policy for team members, optional budget alert.
 Tasks get no IAM role: the agent container has no AWS permissions. Secrets live in SSM Parameter
 Store under `/kiln/<stack>/secrets/` and are injected by ECS at container start.
 
+### Monitor (aws)
+
+Each task has two containers: `agent` and `kiln-monitor` (alpine, a ~5 KB shell script, essential).
+`pidMode: task` and a shared `/kiln` volume let the monitor see every agent process and file.
+
+- Every 5 s it prints JSON records to its log stream: processes (pid, name, state, CPU ticks, RSS),
+  network counters, TCP connections, disk, artifact counts; ECS per-container memory every 30 s.
+- It forwards new `/kiln/outbox.jsonl` lines, and polls the run's inbox object for `kiln send`.
+- It exits 0 at the hard deadline (ECS then stops the task: the in-task cap). On SIGTERM it
+  takes a final reading and uploads `/kiln/artifacts` + inbox/outbox, then exits 143.
+- Before the agent starts it unpacks inputs and touches `/kiln/.ready`; the agent `dependsOn`
+  the monitor being HEALTHY.
+
+The task has no AWS credentials. kiln hands the monitor presigned S3 URLs for this run's objects
+only (`runs/<id>/inbox.jsonl` GET, `artifacts.tgz` PUT, `inputs.tgz` GET), signed with an S3-only
+key from SSM (`/kiln/<stack>/signer`), valid until the hard deadline plus an hour (max 7 days).
+
+The supervisor follows the monitor stream live (polling CloudWatch with a forward token), turns
+records into run events (agent messages, process exits, uploads), and at the end saves every
+record to `.kiln/runs/<id>.monitor.jsonl`, emitting events for any record the live stream missed.
+
+A supervisor proves it is alive by touching `.kiln/runs/<id>.alive` every 5 s; a run with neither a
+recent save nor a recent heartbeat is stale, and `kiln cancel` then stops the task directly.
+
 ## Planned
 
-- Supervisor as an in-task sidecar, run records in S3: `kiln run --detach`, team-shared history
+- Run records in S3 for team-shared history; supervisor inside the task instead of a local background process
 - LLM proxy in the sidecar for token-level caps (the agent never sees real API keys)
 - Team caps (daily/monthly), concurrency limits, `kiln spend`
-- Artifacts, Playwright reports (`kiln report`), `matrix:` sweeps
+- Monitor for docker/podman and the other backends
+- Full per-request network log (a proxy in the task), `matrix:` sweeps
 - `kiln mcp`, JSON Schema for kiln.yaml, GitHub Action
 - k8s, GCP, Azure backends

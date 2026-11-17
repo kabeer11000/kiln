@@ -2,16 +2,19 @@ package kiln
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"math"
-	"os/exec"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Fargate prices, us-east-1, Linux x86 (2026). Spot floats; this is a conservative upper estimate
@@ -25,10 +28,13 @@ const (
 
 	// deadlineGrace lets the supervisor stop the task first; the in-task deadline is the backstop.
 	deadlineGrace = 60
-	deadlineImage = "public.ecr.aws/docker/library/busybox:stable"
+	monitorImage  = "public.ecr.aws/docker/library/alpine:3.20"
 	agentName     = "agent"
-	deadlineName  = "kiln-deadline"
+	monitorName   = "kiln-monitor"
+	deadlineName  = "kiln-deadline" // v1.0 tasks; still recognised when reconciling old runs
 	logPrefix     = "kiln"
+	// urlSlack keeps a run's presigned URLs valid a while past its hard deadline, for the final upload.
+	urlSlack = time.Hour
 )
 
 // AWS runs tasks on ECS Fargate. Infra (cluster, subnets, roles) is created once by
@@ -37,6 +43,7 @@ type AWS struct {
 	Region string
 	Stack  string
 	infra  *awsInfra
+	signer *awsKey
 }
 
 type awsInfra struct {
@@ -46,6 +53,8 @@ type awsInfra struct {
 	ExecutionRoleARN string   `json:"execution_role_arn"`
 	LogGroup         string   `json:"log_group"`
 	SecretsPrefix    string   `json:"secrets_prefix"`
+	Bucket           string   `json:"bucket"`           // v1.1+: artifacts and inbox
+	SignerParameter  string   `json:"signer_parameter"` // v1.1+: SSM name of the URL-signing key
 }
 
 func (a *AWS) cli(ctx context.Context, args ...string) (string, error) {
@@ -111,7 +120,14 @@ func (a *AWS) Start(ctx context.Context, r *Run) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	td, err := a.taskDefinition(r, inf)
+	if err := a.uploadInputs(ctx, r); err != nil {
+		return "", err
+	}
+	urls, err := a.runURLs(ctx, r, time.Now())
+	if err != nil {
+		return "", err
+	}
+	td, err := a.taskDefinition(r, inf, urls)
 	if err != nil {
 		return "", err
 	}
@@ -163,13 +179,87 @@ func (a *AWS) Start(ctx context.Context, r *Run) (string, error) {
 	return res.Tasks[0].TaskArn, nil
 }
 
-func (a *AWS) taskDefinition(r *Run, inf *awsInfra) (map[string]any, error) {
+// runURLs are presigned URLs for this run's objects only: the monitor polls the inbox and
+// uploads artifacts with them, so the task needs no AWS credentials. Empty on pre-v1.1 stacks.
+func (a *AWS) runURLs(ctx context.Context, r *Run, now time.Time) (map[string]string, error) {
+	inf, err := a.load(ctx)
+	if err != nil || inf.Bucket == "" {
+		return map[string]string{}, err
+	}
+	k, err := a.loadSigner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ttl := time.Duration(deadlineSeconds(r.Config.Budget, r.PricePerHour))*time.Second + urlSlack
+	urls := map[string]string{
+		"KILN_INBOX_URL":  presignS3(*k, a.Region, inf.Bucket, runKey(r.ID, "inbox.jsonl"), "GET", now, ttl),
+		"KILN_UPLOAD_URL": presignS3(*k, a.Region, inf.Bucket, runKey(r.ID, "artifacts.tgz"), "PUT", now, ttl),
+	}
+	if r.Inputs != nil {
+		urls["KILN_INPUTS_URL"] = presignS3(*k, a.Region, inf.Bucket, runKey(r.ID, "inputs.tgz"), "GET", now, ttl)
+	}
+	return urls, nil
+}
+
+func runKey(id, name string) string { return "runs/" + id + "/" + name }
+
+// uploadInputs puts the packed inputs where the monitor will fetch them, and checks they are
+// byte-identical to what the run record says (so a rerun can't silently use different files).
+func (a *AWS) uploadInputs(ctx context.Context, r *Run) error {
+	if r.Inputs == nil {
+		return nil
+	}
+	data, err := os.ReadFile(r.Inputs.Local)
+	if err != nil {
+		return &Error{Code: "inputs_missing", Message: "packed inputs " + r.Inputs.Local + " are gone: " + err.Error(),
+			Fix: "run `kiln run` again to repack them from the source files"}
+	}
+	if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != r.Inputs.SHA256 {
+		return &Error{Code: "inputs_changed", Message: r.Inputs.Local + " no longer matches the recorded sha256"}
+	}
+	inf, k, err := a.bucketAndSigner(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = httpDo(ctx, "PUT", presignS3(*k, a.Region, inf.Bucket, runKey(r.ID, "inputs.tgz"), "PUT", time.Now(), 15*time.Minute), data)
+	return err
+}
+
+func (a *AWS) loadSigner(ctx context.Context) (*awsKey, error) {
+	if a.signer != nil {
+		return a.signer, nil
+	}
+	inf, err := a.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if inf.SignerParameter == "" {
+		return nil, &Error{Code: "aws_stack_outdated", Message: "kiln stack " + a.Stack + " has no artifact bucket",
+			Fix: "run `terraform apply` in deploy/aws to upgrade the stack to v1.1"}
+	}
+	out, err := a.cli(ctx, "ssm", "get-parameter", "--name", inf.SignerParameter, "--with-decryption", "--query", "Parameter.Value")
+	if err != nil {
+		return nil, err
+	}
+	var raw string
+	var k awsKey
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(raw), &k); err != nil || k.ID == "" || k.Secret == "" {
+		return nil, fmt.Errorf("%s: not a signing key", inf.SignerParameter)
+	}
+	a.signer = &k
+	return a.signer, nil
+}
+
+func (a *AWS) taskDefinition(r *Run, inf *awsInfra, urls map[string]string) (map[string]any, error) {
 	c := r.Config
 	cpu, mem, err := fargateSize(c.Resources.CPU, c.Resources.MemoryGB)
 	if err != nil {
 		return nil, err
 	}
-	env := []map[string]string{{"name": "KILN_RUN_ID", "value": r.ID}}
+	env := []map[string]string{{"name": "KILN_RUN_ID", "value": r.ID}, {"name": "KILN_DIR", "value": "/kiln"}}
 	for _, k := range slices.Sorted(maps.Keys(c.Env)) {
 		env = append(env, map[string]string{"name": k, "value": c.Env[k]})
 	}
@@ -177,21 +267,34 @@ func (a *AWS) taskDefinition(r *Run, inf *awsInfra) (map[string]any, error) {
 	for _, s := range c.Secrets {
 		secrets = append(secrets, map[string]string{"name": s, "valueFrom": inf.SecretsPrefix + s})
 	}
+	logs := map[string]any{"logDriver": "awslogs", "options": map[string]string{
+		"awslogs-group": inf.LogGroup, "awslogs-region": a.Region, "awslogs-stream-prefix": logPrefix}}
+	mount := []map[string]any{{"sourceVolume": "kiln", "containerPath": "/kiln"}}
 	agent := map[string]any{
 		"name": agentName, "image": c.Image, "essential": true,
-		"environment": env, "secrets": secrets,
-		"stopTimeout": 10, // seconds between SIGTERM and SIGKILL; ECS default is 30, all billed
-		"logConfiguration": map[string]any{"logDriver": "awslogs", "options": map[string]string{
-			"awslogs-group": inf.LogGroup, "awslogs-region": a.Region, "awslogs-stream-prefix": logPrefix}},
+		"environment": env, "secrets": secrets, "mountPoints": mount,
+		"stopTimeout":      10, // seconds between SIGTERM and SIGKILL; ECS default is 30, all billed
+		"logConfiguration": logs,
+		// HEALTHY: the monitor has created /kiln and unpacked any inputs (it touches /kiln/.ready).
+		"dependsOn": []map[string]string{{"containerName": monitorName, "condition": "HEALTHY"}},
 	}
 	if len(c.Command) > 0 {
 		agent["command"] = c.Command
 	}
-	// The deadline container is essential: when its sleep ends, ECS stops the whole task.
+	// The monitor is essential: when it exits at the hard deadline, ECS stops the whole task.
 	// This enforces the caps inside AWS even if the machine running `kiln run` goes away.
-	deadline := map[string]any{
-		"name": deadlineName, "image": deadlineImage, "essential": true, "stopTimeout": 2,
-		"command": []string{"sleep", strconv.Itoa(deadlineSeconds(c.Budget, r.PricePerHour))},
+	// It shares the task's process namespace (pidMode task) so it sees every agent process.
+	monEnv := []map[string]string{{"name": "KILN_DEADLINE", "value": strconv.Itoa(deadlineSeconds(c.Budget, r.PricePerHour))}}
+	for _, k := range slices.Sorted(maps.Keys(urls)) {
+		monEnv = append(monEnv, map[string]string{"name": k, "value": urls[k]})
+	}
+	monitor := map[string]any{
+		"name": monitorName, "image": monitorImage, "essential": true,
+		"stopTimeout": 30,                                                                // time for the final reading and the artifact upload
+		"command":     []string{"sh", "-c", strings.ReplaceAll(monitorScript, "\r", "")}, // CRLF breaks sh
+		"environment": monEnv, "mountPoints": mount, "logConfiguration": logs,
+		"healthCheck": map[string]any{"command": []string{"CMD-SHELL", "test -f /kiln/.ready"},
+			"interval": 5, "timeout": 2, "retries": 3, "startPeriod": 300},
 	}
 	return map[string]any{
 		"family":                  "kiln-" + a.Stack + "-" + c.Name,
@@ -201,7 +304,9 @@ func (a *AWS) taskDefinition(r *Run, inf *awsInfra) (map[string]any, error) {
 		"memory":                  strconv.Itoa(mem),
 		"executionRoleArn":        inf.ExecutionRoleARN,
 		"runtimePlatform":         map[string]string{"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
-		"containerDefinitions":    []any{agent, deadline},
+		"pidMode":                 "task",
+		"volumes":                 []map[string]string{{"name": "kiln"}},
+		"containerDefinitions":    []any{agent, monitor},
 		"tags":                    []map[string]string{{"key": "project", "value": "kiln"}, {"key": "kiln-run", "value": r.ID}},
 	}, nil
 }
@@ -271,7 +376,7 @@ func (t ecsTask) status() Status {
 			if c.ExitCode != nil {
 				agentExit = *c.ExitCode
 			}
-		case c.Name == deadlineName && c.ExitCode != nil:
+		case (c.Name == monitorName || c.Name == deadlineName) && c.ExitCode != nil:
 			deadlineExit = *c.ExitCode
 		}
 	}
@@ -296,16 +401,22 @@ func (t ecsTask) status() Status {
 }
 
 func (a *AWS) Logs(ctx context.Context, handle string, follow bool, w io.Writer) error {
+	return a.logs(ctx, agentName, handle, follow, w)
+}
+
+// Monitor streams the kiln-monitor's JSON records (see MonitorRecord).
+func (a *AWS) Monitor(ctx context.Context, handle string, follow bool, w io.Writer) error {
+	return a.logs(ctx, monitorName, handle, follow, w)
+}
+
+func (a *AWS) logs(ctx context.Context, container, handle string, follow bool, w io.Writer) error {
 	inf, err := a.load(ctx)
 	if err != nil {
 		return err
 	}
-	stream := logPrefix + "/" + agentName + "/" + handle[strings.LastIndex(handle, "/")+1:]
+	stream := logPrefix + "/" + container + "/" + handle[strings.LastIndex(handle, "/")+1:]
 	if follow {
-		cmd := exec.CommandContext(ctx, "aws", "logs", "tail", inf.LogGroup, "--log-stream-names", stream,
-			"--follow", "--format", "short", "--region", a.Region)
-		cmd.Stdout, cmd.Stderr = w, w
-		return cmd.Run()
+		return a.followLogs(ctx, inf.LogGroup, stream, w)
 	}
 	out, err := a.cli(ctx, "logs", "filter-log-events", "--log-group-name", inf.LogGroup,
 		"--log-stream-names", stream, "--query", "events[].message")
@@ -324,6 +435,43 @@ func (a *AWS) Logs(ctx context.Context, handle string, follow bool, w io.Writer)
 	return nil
 }
 
+// followLogs polls the stream with a forward token until ctx ends. (`aws logs tail --follow`
+// is not used: the CLI block-buffers when writing to a pipe, so nothing arrives until it exits.)
+// The stream doesn't exist until the container starts; that and transient errors are retried.
+func (a *AWS) followLogs(ctx context.Context, group, stream string, w io.Writer) error {
+	token := ""
+	for {
+		args := []string{"logs", "get-log-events", "--log-group-name", group, "--log-stream-name", stream,
+			"--start-from-head", "--no-paginate", "--query", "{token: nextForwardToken, lines: events[].message}"}
+		if token != "" {
+			args = append(args, "--next-token", token)
+		}
+		out, err := a.cli(ctx, args...)
+		var page struct {
+			Token string   `json:"token"`
+			Lines []string `json:"lines"`
+		}
+		if err == nil && json.Unmarshal([]byte(out), &page) == nil {
+			for _, l := range page.Lines {
+				if _, err := fmt.Fprintln(w, l); err != nil {
+					return err
+				}
+			}
+			if page.Token != "" {
+				token = page.Token
+			}
+			if len(page.Lines) > 0 {
+				continue // more may be waiting
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
 func (a *AWS) Stop(ctx context.Context, handle string) error {
 	inf, err := a.load(ctx)
 	if err != nil {
@@ -336,12 +484,71 @@ func (a *AWS) Stop(ctx context.Context, handle string) error {
 	if err != nil {
 		return err
 	}
-	if t.LastStatus != "STOPPED" {
-		if _, err := a.cli(ctx, "ecs", "stop-task", "--cluster", inf.Cluster, "--task", handle, "--reason", "stopped by kiln"); err != nil {
-			return err
+	if t.LastStatus == "STOPPED" {
+		return nil
+	}
+	if _, err := a.cli(ctx, "ecs", "stop-task", "--cluster", inf.Cluster, "--task", handle, "--reason", "stopped by kiln"); err != nil {
+		return err
+	}
+	// Wait until it's really stopped: the monitor's final reading and artifact upload happen
+	// during shutdown, and billing runs until then, so the recorded spend stays honest.
+	for {
+		if t, err := a.describe(ctx, handle); err != nil || t.LastStatus == "STOPPED" {
+			return nil // stop-task succeeded; failing to watch it finish isn't a stop failure
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(3 * time.Second):
 		}
 	}
-	return nil
+}
+
+// Send appends a message to the run's inbox. The monitor copies it to /kiln/inbox.jsonl in
+// the task within a few seconds. Each line is {"t": unix seconds, "msg": text}.
+// ponytail: read-modify-write; two senders at the same instant can drop one message.
+func (a *AWS) Send(ctx context.Context, r *Run, msg string) error {
+	inf, k, err := a.bucketAndSigner(ctx)
+	if err != nil {
+		return err
+	}
+	key := runKey(r.ID, "inbox.jsonl")
+	now := time.Now()
+	cur, err := httpDo(ctx, "GET", presignS3(*k, a.Region, inf.Bucket, key, "GET", now, 5*time.Minute), nil)
+	var he *httpError
+	if errors.As(err, &he) && (he.Code == 404 || he.Code == 403) { // 403: no inbox yet (the signer can't list)
+		cur, err = nil, nil
+	}
+	if err != nil {
+		return err
+	}
+	line, _ := json.Marshal(map[string]any{"t": now.Unix(), "msg": msg})
+	body := append(cur, append(line, '\n')...)
+	_, err = httpDo(ctx, "PUT", presignS3(*k, a.Region, inf.Bucket, key, "PUT", now, 5*time.Minute), body)
+	return err
+}
+
+// Artifacts downloads the archive the monitor uploaded when the task stopped.
+func (a *AWS) Artifacts(ctx context.Context, r *Run) ([]byte, error) {
+	inf, k, err := a.bucketAndSigner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data, err := httpDo(ctx, "GET", presignS3(*k, a.Region, inf.Bucket, runKey(r.ID, "artifacts.tgz"), "GET", time.Now(), 5*time.Minute), nil)
+	var he *httpError
+	if errors.As(err, &he) && (he.Code == 404 || he.Code == 403) {
+		return nil, &Error{Code: "no_artifacts", Message: "no artifacts uploaded for " + r.ID,
+			Fix: "artifacts are uploaded when the task stops; put files in /kiln/artifacts inside the task"}
+	}
+	return data, err
+}
+
+func (a *AWS) bucketAndSigner(ctx context.Context) (*awsInfra, *awsKey, error) {
+	k, err := a.loadSigner(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return a.infra, k, nil
 }
 
 // Remove deregisters the per-run task definition. Logs stay in CloudWatch for the retention period.

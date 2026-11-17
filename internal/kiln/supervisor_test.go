@@ -248,3 +248,51 @@ func TestCancelStaleRunRecordsOutcomeIfTaskAlreadyEnded(t *testing.T) {
 		t.Fatalf("direct=%v err=%v state=%s stops=%d removes=%d", direct, err, r.State, f.stops, f.removes)
 	}
 }
+
+// observer adds a monitor stream to the fake: live records while running, the full set after.
+type observer struct {
+	*fake
+	missed, live, final string // missed: in the stream, but the live follow never saw it
+}
+
+func (o *observer) Monitor(ctx context.Context, _ string, follow bool, w io.Writer) error {
+	if !follow {
+		_, err := io.WriteString(w, o.missed+o.live+o.final)
+		return err
+	}
+	if _, err := io.WriteString(w, o.live); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (o *observer) Send(context.Context, *Run, string) error { return nil }
+
+func (o *observer) Artifacts(context.Context, *Run) ([]byte, error) { return nil, nil }
+
+func TestSupervisorRecordsMonitorEvents(t *testing.T) {
+	f := &fake{exitAfter: 20 * time.Second, exitState: Succeeded}
+	sup, r := setup(t, f, Budget{MaxUSD: 1, MaxHours: 1, WarnAt: 0.8}, 0)
+	o := &observer{fake: f, missed: `{"kiln":"start","t":0,"deadline":9}` + "\n",
+		live:  `{"kiln":"outbox","t":1,"line":"step 1"}` + "\n",
+		final: `{"kiln":"outbox","t":2,"line":"done"}` + "\n" + `{"kiln":"uploaded","t":3,"bytes":10}` + "\n",
+	}
+	sup.Backend = o
+	if err := sup.Run(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	var msgs []string
+	for _, e := range r.Events {
+		msgs = append(msgs, e.Message)
+	}
+	all := strings.Join(msgs, "\n")
+	for _, want := range []string{"monitor started", "agent: step 1", "agent: done", "artifacts uploaded"} {
+		if strings.Count(all, want) != 1 {
+			t.Errorf("want %q exactly once in events:\n%s", want, all)
+		}
+	}
+	if b, err := os.ReadFile(sup.Store.MonitorPath(r.ID)); err != nil || !strings.Contains(string(b), `"uploaded"`) {
+		t.Errorf("monitor records not saved: %v %s", err, b)
+	}
+}

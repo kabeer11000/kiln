@@ -1,9 +1,12 @@
 package kiln
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -22,6 +25,7 @@ type Supervisor struct {
 	Now     func() time.Time
 	Sleep   func(context.Context, time.Duration)
 	OnEvent func(*Run, Event)
+	live    *liveMonitor
 }
 
 func NewSupervisor(b Backend, s Store) *Supervisor {
@@ -32,6 +36,7 @@ func NewSupervisor(b Backend, s Store) *Supervisor {
 // The returned error is about kiln itself (e.g. the container could not be stopped);
 // the run's outcome is in r.State.
 func (s *Supervisor) Run(ctx context.Context, r *Run) error {
+	defer s.heartbeat(r.ID)()
 	s.transition(r, Provisioning, "starting on "+r.Config.Backend)
 	if err := s.Store.Save(r); err != nil {
 		return err
@@ -45,9 +50,13 @@ func (s *Supervisor) Run(ctx context.Context, r *Run) error {
 	r.StartedAt = &started
 	s.transition(r, Running, "running")
 
+	s.live = s.watch(ctx, r)
+	defer s.live.stop()
+
 	b := r.Config.Budget
 	warned, statusErrs := false, 0
 	for {
+		s.live.drain(s, r)
 		if err := s.Store.Save(r); err != nil {
 			// Can't record progress, so we can't enforce safely: stop spending.
 			return errors.Join(err, s.Backend.Stop(context.Background(), r.Handle))
@@ -124,6 +133,9 @@ func (s *Supervisor) finish(r *Run, st State, reason string) error {
 		if err := s.saveLogs(ctx, r); err != nil {
 			s.event(r, "could not save logs: "+err.Error())
 		}
+		if err := s.saveMonitor(ctx, r); err != nil {
+			s.event(r, "could not save monitor readings: "+err.Error())
+		}
 		if err := s.Backend.Remove(ctx, r.Handle); err != nil {
 			s.event(r, "could not clean up "+r.Handle+": "+err.Error())
 		}
@@ -140,6 +152,124 @@ func (s *Supervisor) saveLogs(ctx context.Context, r *Run) error {
 	}
 	defer f.Close()
 	return s.Backend.Logs(ctx, r.Handle, false, f)
+}
+
+// liveMonitor follows the monitor stream in the background. Events reach the run record only
+// through drain, on the supervisor's goroutine, so the record is never written concurrently.
+type liveMonitor struct {
+	events chan string
+	// lines counts each record line processed live. The final replay emits events only for
+	// lines not in here: the live stream can miss records (CloudWatch's forward token is
+	// time-based, so a late-indexed record is skipped) and must not cause duplicates either.
+	lines  map[string]int
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (s *Supervisor) watch(ctx context.Context, r *Run) *liveMonitor {
+	ctx, cancel := context.WithCancel(ctx)
+	l := &liveMonitor{events: make(chan string, 256), lines: map[string]int{}, cancel: cancel, done: make(chan struct{})}
+	o, ok := s.Backend.(Observer)
+	if !ok {
+		close(l.done)
+		return l
+	}
+	go func() {
+		defer close(l.done)
+		w := &Watcher{}
+		for ctx.Err() == nil {
+			pr, pw := io.Pipe()
+			go func() { pw.CloseWithError(o.Monitor(ctx, r.Handle, true, pw)) }()
+			pass := map[string]int{} // a retry re-reads from the start; skip what was processed
+			sc := bufio.NewScanner(pr)
+			sc.Buffer(make([]byte, 1<<20), 1<<24)
+			for sc.Scan() {
+				line := sc.Text()
+				if pass[line]++; pass[line] <= l.lines[line] {
+					continue
+				}
+				l.lines[line]++
+				_, evs := w.Feed(line)
+				for _, e := range evs {
+					select {
+					case l.events <- e:
+					default: // never block the stream on a slow supervisor
+					}
+				}
+			}
+			pr.Close()
+			sleepCtx(ctx, 5*time.Second) // real time, not s.Sleep: tests fake the clock
+		}
+	}()
+	return l
+}
+
+func (l *liveMonitor) drain(s *Supervisor, r *Run) {
+	for {
+		select {
+		case e := <-l.events:
+			s.event(r, e)
+		default:
+			return
+		}
+	}
+}
+
+func (l *liveMonitor) stop() {
+	l.cancel()
+	<-l.done
+}
+
+// saveMonitor stores every monitor record next to the run, then replays them so events the
+// live stream missed (the final reading, the artifact upload) still reach the record.
+func (s *Supervisor) saveMonitor(ctx context.Context, r *Run) error {
+	o, ok := s.Backend.(Observer)
+	if !ok || s.live == nil {
+		return nil
+	}
+	s.live.stop()
+	s.live.drain(s, r)
+	var buf bytes.Buffer
+	if err := o.Monitor(ctx, r.Handle, false, &buf); err != nil {
+		return err
+	}
+	if err := os.WriteFile(s.Store.MonitorPath(r.ID), buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	w, liveSeen := &Watcher{}, s.live.lines // safe to read: the live goroutine has exited
+	sc := bufio.NewScanner(&buf)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	for sc.Scan() {
+		line := sc.Text()
+		_, evs := w.Feed(line) // always fed, so state (CPU, exits) matches the live view
+		if liveSeen[line] > 0 {
+			liveSeen[line]--
+			continue
+		}
+		for _, e := range evs {
+			s.event(r, e)
+		}
+	}
+	return sc.Err()
+}
+
+// heartbeat touches the run's .alive file every few seconds until the returned stop is called.
+func (s *Supervisor) heartbeat(id string) (stop func()) {
+	_ = s.Store.Heartbeat(id)
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				_ = s.Store.Heartbeat(id)
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 func (s *Supervisor) transition(r *Run, st State, msg string) {
@@ -163,7 +293,7 @@ func Cancel(ctx context.Context, s Store, b Backend, r *Run, now time.Time) (dir
 	if r.State.Terminal() {
 		return false, &Error{Code: "already_finished", Message: "run " + r.ID + " already " + string(r.State)}
 	}
-	if now.Sub(r.UpdatedAt) < StaleAfter {
+	if !s.Stale(r, now) {
 		return false, s.RequestCancel(r.ID)
 	}
 	state, reason := Cancelled, "cancelled (supervisor was not running)"
@@ -177,6 +307,7 @@ func Cancel(ctx context.Context, s Store, b Backend, r *Run, now time.Time) (dir
 	}
 	// ponytail: a run that crashed mid-Start has no handle; its container (kiln-<id>) needs a manual rm.
 	r.State, r.Reason, r.EndedAt = state, reason, &now
+	r.SpentUSD = r.Duration(now).Hours() * r.PricePerHour // billed until now: the latest it can have stopped
 	r.Events = append(r.Events, Event{At: now, State: state, Message: reason})
 	return true, s.Save(r)
 }

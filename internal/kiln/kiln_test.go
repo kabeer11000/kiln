@@ -152,3 +152,25 @@ func TestContainerRunArgs(t *testing.T) {
 		t.Fatalf("\ngot  %s\nwant %s", got, want)
 	}
 }
+
+func TestStaleUsesHeartbeat(t *testing.T) {
+	s := Store{Dir: t.TempDir()}
+	r := &Run{ID: "r_hb", State: Running}
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	later := r.UpdatedAt.Add(StaleAfter + time.Second)
+	if !s.Stale(r, later) {
+		t.Error("no save and no heartbeat for longer than StaleAfter: stale")
+	}
+	if err := s.Heartbeat(r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s.Stale(r, time.Now().Add(StaleAfter/2)) {
+		t.Error("a recent heartbeat means a live supervisor, even if the record is old")
+	}
+	r.State = Succeeded
+	if s.Stale(r, later.Add(time.Hour)) {
+		t.Error("finished runs are never stale")
+	}
+}

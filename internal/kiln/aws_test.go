@@ -70,7 +70,7 @@ func TestTaskDefinition(t *testing.T) {
 		Env: map[string]string{"MODE": "fast"}, Secrets: []string{"TOKEN"},
 		Budget: Budget{MaxUSD: 5, MaxHours: 1}, Resources: Resources{CPU: 0.25, MemoryGB: 0.5},
 	}}
-	td, err := a.taskDefinition(r, inf)
+	td, err := a.taskDefinition(r, inf, map[string]string{"KILN_UPLOAD_URL": "https://up"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,10 @@ func TestTaskDefinition(t *testing.T) {
 		`"family":"kiln-kiln-exp"`, `"cpu":"256"`, `"memory":"512"`,
 		`"command":["echo","hi"]`, `{"name":"MODE","value":"fast"}`, `{"name":"KILN_RUN_ID","value":"r_1"}`,
 		`{"name":"TOKEN","valueFrom":"/kiln/kiln/secrets/TOKEN"}`,
-		`"name":"kiln-deadline"`, `"command":["sleep","3660"]`, `"essential":true`,
+		`"name":"kiln-monitor"`, `{"name":"KILN_DEADLINE","value":"3660"}`, `"essential":true`,
+		`{"name":"KILN_UPLOAD_URL","value":"https://up"}`, `"pidMode":"task"`, `"volumes":[{"name":"kiln"}]`,
+		`"containerPath":"/kiln"`, `"dependsOn":[{"condition":"HEALTHY","containerName":"kiln-monitor"}]`,
+		`{"name":"KILN_DIR","value":"/kiln"}`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("task definition missing %s\n%s", want, s)
@@ -108,6 +111,8 @@ func TestECSStatus(t *testing.T) {
 		{"succeeded", `{"lastStatus":"STOPPED","containers":[{"name":"agent","exitCode":0,"imageDigest":"sha256:x"},{"name":"kiln-deadline","exitCode":137}]}`, Succeeded, "exit code 0"},
 		{"agent failed", `{"lastStatus":"STOPPED","stoppedReason":"Essential container in task exited","containers":[{"name":"agent","exitCode":2}]}`, Failed, "Essential container in task exited; exit code 2"},
 		{"deadline hit", `{"lastStatus":"STOPPED","containers":[{"name":"agent","exitCode":137},{"name":"kiln-deadline","exitCode":0}]}`, TimedOut, "hard deadline reached (enforced inside AWS)"},
+		{"monitor deadline", `{"lastStatus":"STOPPED","containers":[{"name":"agent","exitCode":137},{"name":"kiln-monitor","exitCode":0}]}`, TimedOut, "hard deadline reached (enforced inside AWS)"},
+		{"monitor stopped normally", `{"lastStatus":"STOPPED","containers":[{"name":"agent","exitCode":0},{"name":"kiln-monitor","exitCode":143}]}`, Succeeded, "exit code 0"},
 		{"pull failed", `{"lastStatus":"STOPPED","stoppedReason":"CannotPullContainerError","containers":[{"name":"agent","reason":"image not found"}]}`, Failed, "CannotPullContainerError; image not found"},
 	}
 	for _, tt := range tests {
@@ -131,5 +136,17 @@ func TestAWSConfigDefaults(t *testing.T) {
 	}
 	if _, err := LoadConfig(writeConfig(t, "name: a\nimage: x\naws: {stack: s}\n")); err == nil {
 		t.Fatal("aws block with docker backend should be rejected")
+	}
+}
+
+func TestMonitorCommandHasNoCR(t *testing.T) {
+	td, err := (&AWS{Region: "us-east-1"}).taskDefinition(&Run{ID: "r", Config: Config{Name: "x", Image: "x",
+		Budget: Budget{MaxUSD: 1, MaxHours: 1}, Resources: Resources{CPU: 0.25, MemoryGB: 0.5}}}, &awsInfra{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon := td["containerDefinitions"].([]any)[1].(map[string]any)
+	if cmd := mon["command"].([]string); strings.ContainsRune(cmd[2], 13) {
+		t.Error("monitor script has carriage returns; sh in the task will fail")
 	}
 }
