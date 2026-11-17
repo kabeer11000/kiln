@@ -1,0 +1,16 @@
+# local caches, tools, run records
+.cache/
+.tools/
+.kiln/
+.remember/
+tasks/
+env.sh
+/kiln
+/kiln.exe
+dist/
+
+# terraform state holds account details; never commit
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
